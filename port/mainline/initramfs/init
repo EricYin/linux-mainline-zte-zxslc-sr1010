@@ -20,30 +20,6 @@ mount_fs() {
 	}
 }
 
-pin_eth_irqs_to_cpu1() {
-	local irq irq_field irq_name line
-
-	[ -d /sys/devices/system/cpu/cpu1 ] || return 0
-	for irq_name in 19000000.ethernet zx279133-idm-local; do
-		irq=
-		while IFS= read -r line; do
-			case "$line" in
-			*"$irq_name"*)
-				irq_field=${line%%:*}
-				irq=${irq_field##* }
-				break
-				;;
-			esac
-		done < /proc/interrupts
-		if [ -n "$irq" ] && [ -w "/proc/irq/$irq/smp_affinity" ]; then
-			printf '2\n' > "/proc/irq/$irq/smp_affinity"
-			say "zxdbg: IRQ $irq ($irq_name) pinned to CPU1"
-		else
-			say "zxdbg: IRQ affinity was not changed for $irq_name"
-		fi
-	done
-}
-
 mount_fs devtmpfs /dev
 mount_fs proc /proc
 mount_fs sysfs /sys
@@ -110,7 +86,7 @@ if [ -e /sys/class/net/eth0 ]; then
 	say '--- bringing eth0 up (192.168.1.1/24) ---'
 	ifconfig eth0 192.168.1.1 netmask 255.255.255.0 up
 	sleep 2
-	pin_eth_irqs_to_cpu1
+	# Preserve the driver's initial LAN/WAN IRQ affinity split.
 	say '--- /proc/interrupts ---'
 	grep -E "ethernet|idm" /proc/interrupts
 	say '--- eth0 state ---'

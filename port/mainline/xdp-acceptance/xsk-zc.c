@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #define _GNU_SOURCE
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <linux/bpf.h>
 #include <linux/ethtool.h>
@@ -96,7 +97,7 @@ static int create_xsk_map(void)
 	return bpf_cmd(BPF_MAP_CREATE, &attr);
 }
 
-static int load_redirect_prog(int map_fd)
+static int load_redirect_prog(int map_fd, unsigned int udp_port)
 {
 	char log[16384] = {};
 	char license[] = "GPL";
@@ -109,6 +110,24 @@ static int load_redirect_prog(int map_fd)
 		BPF_EMIT_CALL(BPF_FUNC_redirect_map),
 		BPF_EXIT_INSN(),
 	};
+	/* Optional fixture filter: keep ARP and unrelated host traffic in Linux. */
+	struct bpf_insn prefix[] = {
+		BPF_RAW_INSN(BPF_LDX | BPF_W | BPF_MEM, 2, 1, 0, 0),
+		BPF_RAW_INSN(BPF_LDX | BPF_W | BPF_MEM, 3, 1, 4, 0),
+		BPF_RAW_INSN(BPF_ALU64 | BPF_MOV | BPF_X, 4, 2, 0, 0),
+		BPF_RAW_INSN(BPF_ALU64 | BPF_ADD | BPF_K, 4, 0, 0, 42),
+		BPF_MOV64_IMM(0, XDP_PASS),
+		BPF_RAW_INSN(BPF_JMP | BPF_JGT | BPF_X, 4, 3, 13, 0),
+		BPF_RAW_INSN(BPF_LDX | BPF_H | BPF_MEM, 4, 2, 12, 0),
+		BPF_RAW_INSN(BPF_JMP | BPF_JNE | BPF_K, 4, 0, 11, htons(ETH_P_IP)),
+		BPF_RAW_INSN(BPF_LDX | BPF_B | BPF_MEM, 4, 2, 14, 0),
+		BPF_RAW_INSN(BPF_JMP | BPF_JNE | BPF_K, 4, 0, 9, 0x45),
+		BPF_RAW_INSN(BPF_LDX | BPF_B | BPF_MEM, 4, 2, 23, 0),
+		BPF_RAW_INSN(BPF_JMP | BPF_JNE | BPF_K, 4, 0, 7, IPPROTO_UDP),
+		BPF_RAW_INSN(BPF_LDX | BPF_H | BPF_MEM, 4, 2, 36, 0),
+		BPF_RAW_INSN(BPF_JMP | BPF_JNE | BPF_K, 4, 0, 5, htons(udp_port)),
+	};
+	struct bpf_insn filtered[20];
 	union bpf_attr attr = {};
 	int fd;
 
@@ -116,6 +135,12 @@ static int load_redirect_prog(int map_fd)
 	attr.expected_attach_type = BPF_XDP;
 	attr.insn_cnt = sizeof(insns) / sizeof(insns[0]);
 	attr.insns = (uintptr_t)insns;
+	if (udp_port) {
+		memcpy(filtered, prefix, sizeof(prefix));
+		memcpy((char *)filtered + sizeof(prefix), insns, sizeof(insns));
+		attr.insn_cnt = sizeof(filtered) / sizeof(filtered[0]);
+		attr.insns = (uintptr_t)filtered;
+	}
 	attr.license = (uintptr_t)license;
 	attr.log_buf = (uintptr_t)log;
 	attr.log_size = sizeof(log);
@@ -390,6 +415,7 @@ int main(int argc, char **argv)
 	struct pollfd pollfd = {};
 	unsigned int ifindex;
 	unsigned int seconds = 30;
+	unsigned int udp_port = 0;
 	uint64_t completions = 0;
 	uint64_t rx_bytes = 0;
 	uint64_t rx_packets = 0;
@@ -399,12 +425,14 @@ int main(int argc, char **argv)
 	int link_fd = -1;
 	int rc = EXIT_FAILURE;
 
-	if (argc < 2 || argc > 3) {
-		fprintf(stderr, "usage: %s IFACE [SECONDS]\n", argv[0]);
+	if (argc < 2 || argc > 4) {
+		fprintf(stderr, "usage: %s IFACE [SECONDS [UDP_PORT]]\n", argv[0]);
 		return EXIT_FAILURE;
 	}
-	if (argc == 3)
+	if (argc >= 3)
 		seconds = strtoul(argv[2], NULL, 0);
+	if (argc == 4)
+		udp_port = strtoul(argv[3], NULL, 0);
 	ifindex = if_nametoindex(argv[1]);
 	if (!ifindex) {
 		perror("if_nametoindex");
@@ -423,7 +451,7 @@ int main(int argc, char **argv)
 		perror("BPF_MAP_CREATE");
 		goto out;
 	}
-	prog_fd = load_redirect_prog(map_fd);
+	prog_fd = load_redirect_prog(map_fd, udp_port);
 	if (prog_fd < 0)
 		goto out;
 	if (update_xsk_map(map_fd, xsk.fd)) {
@@ -438,6 +466,7 @@ int main(int argc, char **argv)
 
 	printf("AF_XDP zero-copy active: if=%s queue=0 frames=%u frame_size=%u\n",
 	       argv[1], FRAME_COUNT, FRAME_SIZE);
+	fflush(stdout);
 	pollfd.fd = xsk.fd;
 	pollfd.events = POLLIN;
 	started = time(NULL);

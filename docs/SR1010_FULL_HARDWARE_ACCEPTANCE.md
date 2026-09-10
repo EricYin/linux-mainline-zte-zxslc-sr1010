@@ -62,7 +62,19 @@ watchdog 实际复位放在最后执行。USB 只写专用测试文件，不做 
 |EEE|1G、2.5G 下 enable/disable A/B，观察 active 状态、吞吐和错误计数|协商状态正确；开启后不掉速、不丢包、不掉链|
 |TX checksum|IPv4 TCP 硬件 checksum；UDP、IPv6、封装流量验证软件 fallback|抓包校验正确；只广告和执行已实现范围|
 
-RX checksum、SG、TSO/GSO/LRO、RSS/多队列当前没有实现，不做伪功能验收；只检查 netdev 没有错误广告这些 feature。
+RX checksum 已接入 XMAC IPC：基本 IPv4/IPv6 TCP/UDP 和单层 VLAN 可使用
+`CHECKSUM_UNNECESSARY`；QinQ、PPPoE、分片、扩展头、零 UDP checksum 和
+经过 XDP 的包保留软件校验。ethtool RXCSUM 控制是否信任结果，MAC 错误包
+过滤始终开启。验收时同时关闭 conduit/user GRO，避免将 GRO 软件校验误认为
+驱动硬件校验。逐包证据见 `docs/mainline-network/NIC_OFFLOAD_PROGRESS.md`。
+
+TX 多队列已接入：WAN 和 LAN conduit 各公开两条 Linux TX 队列，使用
+IDM 硬件队列 1、2，独立管理 ring、完成计数和 BQL；并发数据、单队列
+96 MiB 数据完整性及 16 位完成计数回绕均已通过。RX 已接入独立 worker/NAPI、
+WAN/LAN RSS bucket map 和限定 IPv4 TCP/UDP 硬件 hash；范围及回归见
+`docs/mainline-network/RSS_CLOSURE_ACCEPTANCE.md`。SG、TSO/TSO6 保持阻塞，
+2026-09-10 按用户要求停止继续探索，不能广告对应 feature。内核的软件
+GSO/GRO 不属于“缺失的硬件分段”；不以 LRO 作为普通路由器目标。
 
 ## 5. RTL8372N DSA 交换机
 
@@ -147,8 +159,9 @@ member 转发和链路切换已经验收；双在线成员的按 hash 分流，�
 
 当前镜像没有可用生产路径：I2C、PWM、PCIe、RapidIO、WLAN、cpufreq/DVFS、suspend、硬件 crypto。
 
-当前网络驱动仍没有完整通用 NIC/交换机能力：RSS/多队列、WoL、DSA
-devlink resource/health、CBS/TAPRIO/ETF 和 per-queue stats。RTL8372N 已有
+当前网络驱动仍没有完整通用 NIC/交换机能力：通用 IPv6 RSS、SG/TSO、WoL、DSA
+devlink resource/health、CBS/TAPRIO/ETF。RX/TX 多队列及相应统计已有实现，
+RSS 的支持范围以专项验收为准。RTL8372N 已有
 专用 offline self-test；内部 PHY 已接入标准 phylib，支持真实链路协商、EEE 和
 ethtool cable-test；bridge MSTP 已接入 VLAN→MSTI、端口状态和 VLAN
 fast-age。IGMP/MLD 已走 Linux bridge snooping 到硬件 MDB；RTL8372N ACL
