@@ -17,7 +17,7 @@
 1. **产品控制面缺口**：原厂 FFE/CSPKernel、URL/DNS/应用识别、私有 QoS/ACL/meter、多播控制、DPI、私有 proc/sysfs/ioctl、诊断/测试接口没有复刻。
 2. **PON 产品栈缺口**：主线有 SerDes/PHY 物理层，但没有 GPON/EPON/XG(S)-PON MAC、OMCI、OAM、DBA 和光模块管理栈。
 3. **通用 Linux 产品配置缺口**：当前诊断配置没有 cgroup、namespace、seccomp、perf、kexec、XFRM/IPsec、完整 crypto、JFFS2/SquashFS/UBIFS/NTFS3/FUSE/overlay、I2C、PWM、suspend/cpufreq/regulator 等。
-4. **通用 NIC/交换机缺口**：通用 IPv6 RSS、SG/TSO、可调 ring/coalescing/channels、WoL、动态 RX 地址过滤、jumbo 9K、DSA devlink 和部分高级 QoS 仍缺失或未实现；RX/TX 多队列、限定 IPv4 RSS 和可写 bucket map 已有验收，RTL8372N 已有专用 offline self-test 和内部 PHY 线缆诊断。
+4. **通用 NIC/交换机缺口**：复杂扩展头/封装的通用 RX hash、SG/TSO、可调 ring/coalescing/channels、WoL、动态 RX 地址过滤、jumbo 9K、DSA devlink 和部分高级 QoS 仍缺失或未实现；RX/TX 多队列、基本 IPv4/IPv6 TCP/UDP RSS 和可写 bucket map 已有验收，RTL8372N 已有专用 offline self-test 和内部 PHY 线缆诊断。
 
 因此，可信的表述是：**有线路由核心路径已达到可用且有较强板上验收证据；完整原厂产品能力、完整通用 NIC 能力和完整产品内核配置均未达到。**
 
@@ -276,7 +276,7 @@
 |TX checksum|只对非封装 IPv4 TCP 硬件生成；其他协议软件 fallback|源码明确限制；无 UDP/IPv6/encap HW checksum|A/B/部分|
 |RX checksum|XMAC IPC + `NETIF_F_RXCSUM`；基本 IPv4/IPv6 TCP/UDP 和单层 VLAN|2026-09-05 WAN/LAN 正误包、逐包 auxdata、off/on、XDP 与封装例外验收；MAC 错误过滤常开，feature 控制 skb 校验结果的使用|A/B/部分|
 |SG/TSO/TSO6|未声明、无硬件分段链实现；软件 GSO/GRO 仍可用|原厂普通 GSO 路径会复制 fragments，upload 路径是零填充模板，不能据函数名宣称普通 TSO|B/驱动未实现|
-|RSS/多队列|WAN/LAN conduit 双 RX/TX 队列、独立 RX worker、可写 RSS map、限定 IPv4 TCP/UDP 硬件 hash；AF_XDP 和不支持格式有明确 fallback|见 `mainline-network/RSS_CLOSURE_ACCEPTANCE.md`，166 项闭环检查通过；不宣称通用 IPv6 RSS|A/B/部分|
+|RSS/多队列|WAN/LAN conduit 双 RX/TX 队列、独立 RX worker、可写 RSS map、基本 IPv4/IPv6 TCP/UDP 硬件 hash；AF_XDP、分片、扩展头和缺少输出偏移的 CPU 拷贝有明确 fallback|见 `mainline-network/RSS_CLOSURE_ACCEPTANCE.md` 和 `RSS_IPV6_ACCEPTANCE.md`；IPv6 矩阵 764 项检查、UDP/TCP、生命周期及默认 RAM 启动通过|A/B/部分|
 |固定 ring 查询|`ethtool -g` 可读 RX 2048/TX 1024|没有 `set_ringparam`|B/部分|
 |统计|标准 stats64 + 64 项左右 ethtool SW/HW/XDP/XSK stats|实现；硬件 MIB/软件错误统计可读|A/B|
 |动态 RX 地址过滤|明确没有 `ndo_set_rx_mode`；NPPT 固定 admission 会送 foreign unicast/multicast|缺失，不应宣称硬件过滤|
@@ -458,7 +458,7 @@ LAG 的单 active member 转发、故障切换和完整生命周期已经验收�
 |WAN PHY/SerDes/XPCS|私有模块|标准 phylib/phylink/Generic PHY/XPCS|核心路径已具备|
 |LAN switch|私有 RTL SDK，ACL/统计/调试广|DSA bridge/STP/VLAN/FDB/MDB/LAG/mirror/ACL/QoS/MIB|核心与多项高级能力具备，仍非产品全功能|
 |WAN/LAN CPU packet I/O|plat/np/switch 私有路径|IDM DMA/NAPI/page-pool/BQL|核心已具备|
-|通用 NIC offloads|原厂私有能力较广但 Linux 标准暴露不完整|RX 基本 IPv4/IPv6 TCP/UDP csum、TX IPv4/TCP csum、RX/TX 多队列、限定 IPv4 RSS、XDP/AF_XDP；SG/TSO 阻塞|部分具备；以 checksum、RSS 闭环和 TSO PPU 专项报告为准|
+|通用 NIC offloads|原厂私有能力较广但 Linux 标准暴露不完整|RX 基本 IPv4/IPv6 TCP/UDP csum、TX IPv4/TCP csum、RX/TX 多队列、基本 IPv4/IPv6 RSS、WAN XDP/共享 AF_XDP；SG/TSO 阻塞|部分具备；以 checksum、RSS 闭环、IPv6 RSS 和 TSO PPU 专项报告为准|
 |IPv4 route/NAT offload|FFE/NP FAST|标准 nft/tc → NPPT|已具备并有强验收|
 |IPv6 route offload|原厂符号/API 存在|精确 TCP/UDP route|已具备并有强验收|
 |PPPoE offload|原厂 FAST/WANID|IPv4/IPv6 push/pop|已具备；单 SID|
@@ -494,7 +494,7 @@ LAG 的单 active member 转发、故障切换和完整生命周期已经验收�
 - 原厂 FFE/CSPKernel/DPI/URL filter 产品功能
 - 剩余 QoS/ACL/multicast 产品能力
 - 多 WAN、多 PPPoE、多 SNAT context
-- SG/TSO、通用 IPv6 RSS、完整 PTP packet timestamp；RX checksum、RX/TX 多队列及限定 IPv4 RSS 已有实测路径，本板 RTL8372N PTP block 未供时；SG/TSO 探索于 2026-09-10 按用户要求停止
+- SG/TSO、复杂扩展头/封装的通用 RX hash、完整 PTP packet timestamp；RX checksum、RX/TX 多队列及基本 IPv4/IPv6 RSS 已有实测路径，本板 RTL8372N PTP block 未供时；SG/TSO 探索于 2026-09-10 按用户要求停止
 - RTL8372N 剩余 per-queue stats、devlink，以及 ACL VLAN pop 的 tagged endpoint A/B
 - I2C controller、PWM 实机启用与验收
 - suspend/resume/WoL 与完整电源域/DVFS

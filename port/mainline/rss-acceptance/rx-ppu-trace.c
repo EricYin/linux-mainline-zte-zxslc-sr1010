@@ -18,9 +18,11 @@ static bool alu_test, calibrated;
 static int calibration_result;
 static bool hash_test, hash_inserted;
 static bool late_hash;
+static bool ipv6_hash;
 static u32 hash_replay_pc = 561;
 static u32 hash_tag_words, hash_raw, hash_value, hash_queue;
-static u64 hash_ops[32];
+static u64 hash_ops[64];
+static u32 hash_accumulator[64], hash_operand[64];
 static unsigned int hash_op_count;
 static char *frame;
 module_param(pc, uint, 0400);
@@ -29,6 +31,8 @@ module_param(queue, int, 0400);
 module_param(alu_test, bool, 0400);
 module_param(hash_test, bool, 0400);
 module_param(late_hash, bool, 0400);
+module_param(ipv6_hash, bool, 0400);
+MODULE_PARM_DESC(ipv6_hash, "Calibrate basic IPv6 tuple loads at the CPU output hook");
 MODULE_PARM_DESC(hash_test, "Compute a folded IPv4 tuple XOR on one matched context");
 MODULE_PARM_DESC(alu_test, "Calibrate existing ALU forms and adjacent boolean selectors");
 MODULE_PARM_DESC(queue, "Optional same-group queue override for one matched context");
@@ -337,8 +341,16 @@ static u64 reg_xor(u32 dst, u32 a, u32 b)
 
 static int hash_operation(void __iomem *pps, u32 selected, u64 inst)
 {
-	hash_ops[hash_op_count++] = inst;
-	return replay_return(pps, selected, inst, hash_replay_pc);
+	void __iomem *spr = pps + 0x4500 + selected_me * 0x400;
+	int ret;
+
+	if (hash_op_count == ARRAY_SIZE(hash_ops))
+		return -E2BIG;
+	ret = replay_return(pps, selected, inst, hash_replay_pc);
+	hash_ops[hash_op_count] = inst;
+	hash_accumulator[hash_op_count] = readl(spr + 8);
+	hash_operand[hash_op_count++] = readl(spr + 64);
+	return ret;
 }
 
 static int compute_late_hash(void __iomem *pps, u32 selected, u32 addr)
@@ -365,10 +377,31 @@ static int compute_late_hash(void __iomem *pps, u32 selected, u32 addr)
 		if (ret)
 			return ret;
 	}
-	for (i = 0; i < ARRAY_SIZE(ops); i++) {
-		ret = hash_operation(pps, selected, ops[i]);
-		if (ret)
-			return ret;
+	if (ipv6_hash) {
+		/* L3-relative loads: all four words of each address, not just the suffix. */
+		for (i = 0; i < 8; i++) {
+			u64 load = 0x0700000028000523ULL |
+				   (u64)(i ? 16 : 2) << 46 | (u64)(8 + i * 4) << 17;
+
+			ret = hash_operation(pps, selected, load);
+			if (!ret && i)
+				ret = hash_operation(pps, selected, reg_xor(2, 2, 16));
+			if (ret)
+				return ret;
+		}
+		for (i = 3; i < ARRAY_SIZE(ops); i++) {
+			u64 inst = i == 5 ? 0x07040000280c0520ULL : ops[i];
+
+			ret = hash_operation(pps, selected, inst);
+			if (ret)
+				return ret;
+		}
+	} else {
+		for (i = 0; i < ARRAY_SIZE(ops); i++) {
+			ret = hash_operation(pps, selected, ops[i]);
+			if (ret)
+				return ret;
+		}
 	}
 	hash_raw = readl(spr + 8);
 	for (i = 0; i < ARRAY_SIZE(shifts); i++) {
@@ -474,7 +507,7 @@ static int capture(void __iomem *pps, u32 selected)
 		for (i = 0; i < ARRAY_SIZE(s->words); i++)
 			s->words[i] = readl(pps + 0x4400 + selected_me * 0x400 + i * 4);
 		if (hash_export && !hash_exported && addr == 2216 &&
-		    (s->words[74] & BIT(4)) && !(s->words[74] & BIT(21)) &&
+		    (s->words[74] & BIT(ipv6_hash ? 3 : 4)) && !(s->words[74] & BIT(21)) &&
 		    (s->words[74] & (BIT(5) | BIT(6)))) {
 			u32 saved31 = s->words[95];
 			int restore;
@@ -701,8 +734,10 @@ static int trace_show(struct seq_file *s, void *unused)
 		seq_printf(s, "branch_cond=%04x spr10=%08x taken=%u\n",
 			   branch_conditions[op], branch_inputs[input], branch_results[op][input]);
 	}
+	seq_printf(s, "ipv6_hash=%u\n", ipv6_hash);
 	for (n = 0; n < hash_op_count; n++)
-		seq_printf(s, "hash_op=%u inst=%016llx\n", n, hash_ops[n]);
+		seq_printf(s, "hash_op=%u inst=%016llx accumulator=%08x operand=%08x\n",
+			   n, hash_ops[n], hash_accumulator[n], hash_operand[n]);
 	seq_printf(s, "calibrated=%u calibration_result=%d alu_count=%u flags=%08x/%08x\n",
 		   calibrated, calibration_result, alu_count, alu_flags_before, alu_flags_after);
 	for (n = 0; n < alu_count; n++) {
@@ -747,6 +782,16 @@ static int __init rx_trace_init(void)
 		return -EINVAL;
 	if (hex2bin(expected, frame, len))
 		return -EINVAL;
+	if (ipv6_hash) {
+		unsigned int network = get_unaligned_be16(expected + 12) == 0x8100 ? 18 : 14;
+
+		if (!output_hash || !hash_export || hash_test || alu_test || queue >= 0 ||
+		    len < network + 60 ||
+		    get_unaligned_be16(expected + network - 2) != 0x86dd ||
+		    expected[network] >> 4 != 6 ||
+		    (expected[network + 6] != 6 && expected[network + 6] != 17))
+			return -EINVAL;
+	}
 	if (hash_test) {
 		unsigned int network = 14;
 

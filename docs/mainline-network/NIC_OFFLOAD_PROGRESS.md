@@ -1,5 +1,14 @@
 # NIC offload implementation and acceptance
 
+## IPv6 RSS continuation, 2026-09-12
+
+At the user's request, RSS work resumed for IPv6. The combined IPv4/IPv6
+program adds full IPv6 TCP/UDP tuple hashing and preserves the two RX queues
+on WAN and the LAN conduit. The [IPv6 acceptance report](RSS_IPV6_ACCEPTANCE.md)
+records 764 matrix checks, ordered UDP and TCP integrity, and XDP/UMEM behavior.
+It also documents the CPU-output offset guard and the explicit no-hash fallback.
+The previous decision to stop SG/TSO exploration remains in force.
+
 ## Final scope, 2026-09-10
 
 The user ended this investigation. Keep the accepted RX checksum and

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Count and verify exact basic IPv4/IPv6 fixtures delivered to a netdev. */
+/* Count and verify exact IPv4/IPv6 fixtures delivered to a netdev. */
 #include <arpa/inet.h>
 #include <errno.h>
 #include <linux/filter.h>
@@ -31,10 +31,11 @@ int main(int argc, char **argv)
 	socklen_t size = sizeof(stats);
 	unsigned int length, i, received = 0, bad = 0, value, transport;
 	unsigned int address_offset, address_length, protocol_offset;
+	unsigned int target = 0;
 	int fd;
 	int receive_buffer = 4 * 1024 * 1024;
 
-	if ((argc != 3 && argc != 4) || strlen(argv[2]) % 2 || strlen(argv[2]) > 4096)
+	if ((argc != 3 && argc != 4 && argc != 5) || strlen(argv[2]) % 2 || strlen(argv[2]) > 4096)
 		return 2;
 	length = strlen(argv[2]) / 2;
 	for (i = 0; i < length; i++) {
@@ -51,7 +52,7 @@ int main(int argc, char **argv)
 		address_length = 8;
 		protocol_offset = 23;
 	} else if (expected[12] == 0x86 && expected[13] == 0xdd &&
-		   expected[14] >> 4 == 6 && expected[20] == 17) {
+		   expected[14] >> 4 == 6) {
 		transport = 54;
 		address_offset = 22;
 		address_length = 32;
@@ -76,7 +77,9 @@ int main(int argc, char **argv)
 		close(fd);
 		return 1;
 	}
-	if (argc == 4) {
+	if (argc == 5)
+		target = strtoul(argv[4], NULL, 10);
+	if (argc >= 4 && strcmp(argv[3], "-")) {
 		char *end;
 		unsigned long hash = strtoul(argv[3], &end, 16);
 		struct sock_filter filter[] = {
@@ -101,7 +104,7 @@ int main(int argc, char **argv)
 	pollfd.events = POLLIN;
 	puts("RAW_VERIFY_READY");
 	fflush(stdout);
-	while (!stopped) {
+	while (!stopped && (!target || received < target)) {
 		struct sockaddr_ll from;
 		socklen_t from_size = sizeof(from);
 		ssize_t bytes;

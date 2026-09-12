@@ -17,7 +17,12 @@
 int main(int argc, char **argv)
 {
 	struct sockaddr_in local = { .sin_family = AF_INET,
-				     .sin_port = htons(49000) }, peer;
+				     .sin_port = htons(49000) };
+	struct sockaddr_in6 local6 = { .sin6_family = AF_INET6,
+				       .sin6_port = htons(49000) };
+	struct sockaddr_storage peer;
+	struct sockaddr *bind_address;
+	socklen_t address_size;
 	struct timeval timeout = { .tv_sec = 30 };
 	unsigned char seen[FLOWS][COUNT] = { 0 }, packet[2048];
 	unsigned int next[FLOWS] = { 0 }, per_flow[FLOWS] = { 0 };
@@ -30,14 +35,24 @@ int main(int argc, char **argv)
 	first = strtoul(argv[2], NULL, 10);
 	flows = strtoul(argv[3], NULL, 10);
 	count = strtoul(argv[4], NULL, 10);
-	if (!flows || first + flows > FLOWS || !count || count > COUNT ||
-	    inet_pton(AF_INET, argv[1], &local.sin_addr) != 1)
+	if (!flows || first + flows > FLOWS || !count || count > COUNT)
 		return 2;
+	if (strchr(argv[1], ':')) {
+		if (inet_pton(AF_INET6, argv[1], &local6.sin6_addr) != 1)
+			return 2;
+		bind_address = (struct sockaddr *)&local6;
+		address_size = sizeof(local6);
+	} else {
+		if (inet_pton(AF_INET, argv[1], &local.sin_addr) != 1)
+			return 2;
+		bind_address = (struct sockaddr *)&local;
+		address_size = sizeof(local);
+	}
 	expected = flows * count;
-	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	fd = socket(bind_address->sa_family, SOCK_DGRAM, 0);
 	if (fd < 0 || setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size)) ||
 	    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) ||
-	    bind(fd, (struct sockaddr *)&local, sizeof(local))) {
+	    bind(fd, bind_address, address_size)) {
 		perror("UDP receiver setup");
 		return 2;
 	}
@@ -46,6 +61,7 @@ int main(int argc, char **argv)
 	while (received < expected) {
 		socklen_t peer_length = sizeof(peer);
 		uint32_t header[4];
+		unsigned int peer_port;
 		ssize_t length = recvfrom(fd, packet, sizeof(packet), 0,
 					  (struct sockaddr *)&peer, &peer_length);
 
@@ -63,11 +79,14 @@ int main(int argc, char **argv)
 			continue;
 		}
 		memcpy(header, packet, sizeof(header));
+		peer_port = peer.ss_family == AF_INET6 ?
+			ntohs(((struct sockaddr_in6 *)&peer)->sin6_port) :
+			ntohs(((struct sockaddr_in *)&peer)->sin_port);
 		flow = ntohl(header[1]);
 		sequence = ntohl(header[2]);
 		if (ntohl(header[0]) != 0x52535331 || flow < first ||
 		    flow >= first + flows || sequence >= count ||
-		    ntohl(header[3]) != count || ntohs(peer.sin_port) != 48000 + flow) {
+		    ntohl(header[3]) != count || peer_port != 48000 + flow) {
 			bad++;
 			continue;
 		}

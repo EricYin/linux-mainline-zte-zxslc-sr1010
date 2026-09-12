@@ -9,6 +9,7 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/wait.h>
+#include <string.h>
 #include <unistd.h>
 
 static int verify(int fd)
@@ -55,20 +56,35 @@ static int verify(int fd)
 int main(int argc, char **argv)
 {
 	struct sockaddr_in address = { .sin_family = AF_INET };
+	struct sockaddr_in6 address6 = { .sin6_family = AF_INET6 };
+	struct sockaddr *bind_address;
+	socklen_t address_size;
 	struct timeval timeout = { .tv_sec = 15 };
 	pid_t children[8];
 	unsigned int i, started = 0;
 	int listener, fd, status, failed = 0, one = 1;
 
-	if (argc != 3 || inet_pton(AF_INET, argv[1], &address.sin_addr) != 1)
+	if (argc != 3)
 		return 2;
-	address.sin_port = htons(strtoul(argv[2], NULL, 10));
-	listener = socket(AF_INET, SOCK_STREAM, 0);
+	if (strchr(argv[1], ':')) {
+		if (inet_pton(AF_INET6, argv[1], &address6.sin6_addr) != 1)
+			return 2;
+		address6.sin6_port = htons(strtoul(argv[2], NULL, 10));
+		bind_address = (struct sockaddr *)&address6;
+		address_size = sizeof(address6);
+	} else {
+		if (inet_pton(AF_INET, argv[1], &address.sin_addr) != 1)
+			return 2;
+		address.sin_port = htons(strtoul(argv[2], NULL, 10));
+		bind_address = (struct sockaddr *)&address;
+		address_size = sizeof(address);
+	}
+	listener = socket(bind_address->sa_family, SOCK_STREAM, 0);
 	if (listener < 0)
 		return 1;
 	setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 	setsockopt(listener, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-	if (bind(listener, (struct sockaddr *)&address, sizeof(address)) ||
+	if (bind(listener, bind_address, address_size) ||
 	    listen(listener, 8)) {
 		perror("listen");
 		close(listener);

@@ -20,17 +20,20 @@ def main():
             1 <= args.count <= 512):
         parser.error("flows must fit 0..7; count must fit 1..512")
     sockets = []
+    family, _, _, _, destination = socket.getaddrinfo(
+        args.destination, 49000, type=socket.SOCK_DGRAM)[0]
     try:
         for flow in range(args.first, args.first + args.flows):
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.bind((args.source, 48000 + flow))
+            sock = socket.socket(family, socket.SOCK_DGRAM)
+            source = socket.getaddrinfo(args.source, 48000 + flow, family, socket.SOCK_DGRAM)[0][4]
+            sock.bind(source)
             sockets.append((flow, sock))
         for sequence in range(args.count):
             for flow, sock in sockets:
                 payload = struct.pack("!IIII", 0x52535331, flow, sequence, args.count)
                 payload += bytes((flow * 31 + sequence + offset) % 251
                                  for offset in range(16, 256))
-                sock.sendto(payload, (args.destination, 49000))
+                sock.sendto(payload, destination)
             time.sleep(0.001)
         print(json.dumps({"packets": args.flows * args.count, "bytes_per_packet": 256}))
     finally:

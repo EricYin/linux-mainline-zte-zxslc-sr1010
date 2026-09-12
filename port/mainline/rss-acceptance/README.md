@@ -1,5 +1,12 @@
 # Ordinary RX PPU diagnostics
 
+Current IPv6 implementation and evidence: [IPv6 RSS acceptance](../../../docs/mainline-network/RSS_IPV6_ACCEPTANCE.md).
+`generate-ipv6-rss.py` emits the combined programs; `run-ipv6-rss-matrix.py`
+and `audit-ipv6-rss.py` validate ring assignment, payloads and skb hash controls.
+`run-ipv6-streams.py` adds IPv6 UDP order/TCP byte tests using existing link-local
+addresses. `run-ipv6-lifecycle.py` covers WAN XDP and shared UMEM. Historical
+IPv4-only and external-patch instructions below describe their dated stages.
+
 Latest metadata diagnostic: [DMA hash export](../../../docs/mainline-network/RSS_DMA_HASH_EXPORT.md).
 `run-rx-metadata.py --flow N` reads stable consumed slots on a fresh default-on
 boot. `run-rx-hash-export.py --mode wan --kind ipv4-udp --raw` combines one

@@ -71,8 +71,9 @@ RX checksum 已接入 XMAC IPC：基本 IPv4/IPv6 TCP/UDP 和单层 VLAN 可使�
 TX 多队列已接入：WAN 和 LAN conduit 各公开两条 Linux TX 队列，使用
 IDM 硬件队列 1、2，独立管理 ring、完成计数和 BQL；并发数据、单队列
 96 MiB 数据完整性及 16 位完成计数回绕均已通过。RX 已接入独立 worker/NAPI、
-WAN/LAN RSS bucket map 和限定 IPv4 TCP/UDP 硬件 hash；范围及回归见
-`docs/mainline-network/RSS_CLOSURE_ACCEPTANCE.md`。SG、TSO/TSO6 保持阻塞，
+WAN/LAN RSS bucket map 和基本 IPv4/IPv6 TCP/UDP 硬件 hash；范围及回归见
+`docs/mainline-network/RSS_CLOSURE_ACCEPTANCE.md` 和
+`docs/mainline-network/RSS_IPV6_ACCEPTANCE.md`。SG、TSO/TSO6 保持阻塞，
 2026-09-10 按用户要求停止继续探索，不能广告对应 feature。内核的软件
 GSO/GRO 不属于“缺失的硬件分段”；不以 LRO 作为普通路由器目标。
 
@@ -159,7 +160,7 @@ member 转发和链路切换已经验收；双在线成员的按 hash 分流，�
 
 当前镜像没有可用生产路径：I2C、PWM、PCIe、RapidIO、WLAN、cpufreq/DVFS、suspend、硬件 crypto。
 
-当前网络驱动仍没有完整通用 NIC/交换机能力：通用 IPv6 RSS、SG/TSO、WoL、DSA
+当前网络驱动仍没有完整通用 NIC/交换机能力：复杂扩展头/封装的通用 RX hash、SG/TSO、WoL、DSA
 devlink resource/health、CBS/TAPRIO/ETF。RX/TX 多队列及相应统计已有实现，
 RSS 的支持范围以专项验收为准。RTL8372N 已有
 专用 offline self-test；内部 PHY 已接入标准 phylib，支持真实链路协商、EEE 和

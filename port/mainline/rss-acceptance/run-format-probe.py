@@ -2,6 +2,7 @@
 """Observe ordinary RX paths for explicit packet formats, without hash injection."""
 
 import argparse
+import ipaddress
 import json
 from pathlib import Path
 import re
@@ -19,13 +20,14 @@ BOARD = runpy.run_path(str(NETWORK / "nic-rx-accept.py"))["board"]
 PACKETS = runpy.run_path(str(NETWORK / "nic-checksum-packets.py"))
 STATS = runpy.run_path(str(NETWORK / "nic-rx-parallel.py"))["stats"]
 KINDS = ("ipv4-udp", "ipv4-tcp", "ipv4-ack", "ipv4-options", "ipv4-frag-first",
-         "ipv4-frag-later", "ipv6-udp", "ipv6-options", "ipv6-frag-first",
+         "ipv4-frag-later", "ipv6-udp", "ipv6-tcp", "ipv6-ack", "ipv6-options", "ipv6-frag-first",
          "ipv6-frag-later", "ipv4-icmp", "nonip", "arp", "vlan", "qinq", "pppoe",
          "ipv4-bad-checksum", "ipv4-ihl4", "ipv4-total-short", "ipv4-total-long",
          "ipv4-truncated", "udp-length-short", "udp-length-long", "tcp-doff4")
 
 
-def make_frame(mode, kind, mac, flow_hit=False, source_port=48000):
+def make_frame(mode, kind, mac, flow_hit=False, source_port=48000,
+               ipv6_source=None, ipv6_destination=None):
     network = 1 if mode == "wan" else 5
     source_mac = "00:e0:41:68:0d:86" if mode == "wan" else "f8:89:3c:26:fe:02"
     source, destination = f"192.168.{network}.100", f"192.168.{network}.1"
@@ -33,8 +35,9 @@ def make_frame(mode, kind, mac, flow_hit=False, source_port=48000):
         destination = "192.168.1.100"
     v6 = kind.startswith("ipv6")
     if v6:
-        source, destination = f"2001:db8:{network}::100", f"2001:db8:{network}::1"
-    proto = 6 if kind in ("ipv4-tcp", "ipv4-ack", "tcp-doff4") else 17
+        source = ipv6_source or f"2001:db8:{network}::100"
+        destination = ipv6_destination or f"2001:db8:{network}::1"
+    proto = 6 if kind in ("ipv4-tcp", "ipv4-ack", "ipv6-tcp", "ipv6-ack", "tcp-doff4") else 17
     packet = bytearray(PACKETS["frame"](source_mac, mac, source, destination, proto,
                                       5301 if flow_hit else source_port)[:-28])
     transport = 54 if v6 else 34
@@ -42,8 +45,8 @@ def make_frame(mode, kind, mac, flow_hit=False, source_port=48000):
         packet[transport + 4:transport + 6] = struct.pack("!H", len(packet) - transport)
         if flow_hit:
             packet[transport + 2:transport + 4] = struct.pack("!H", 5301)
-    if kind == "ipv4-ack":
-        packet[47] = 0x10
+    if kind in ("ipv4-ack", "ipv6-ack"):
+        packet[transport + 13] = 0x10
     offset = transport + (6 if proto == 17 else 16)
     packet[offset:offset + 2] = b"\0\0"
     pseudo = ((packet[22:54] + struct.pack("!I3xB", len(packet) - transport, proto))
@@ -94,17 +97,27 @@ def make_frame(mode, kind, mac, flow_hit=False, source_port=48000):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("wan", "lan"), default="wan")
+    parser.add_argument("--pc", type=int, choices=(561, 2215), default=561)
     parser.add_argument("--kind", choices=KINDS, default="ipv4-udp")
     parser.add_argument("--branch-test", action="store_true")
     parser.add_argument("--branch-swap", action="store_true")
     parser.add_argument("--rss-map-test", action="store_true")
     parser.add_argument("--hash-export", action="store_true")
     parser.add_argument("--output-hash", action="store_true")
+    parser.add_argument("--ipv6-hash", action="store_true")
+    parser.add_argument("--ipv6-source", type=ipaddress.IPv6Address)
+    parser.add_argument("--ipv6-destination", type=ipaddress.IPv6Address)
     parser.add_argument("--metadata-loads", action="store_true")
     parser.add_argument("--native-export", action="store_true")
     parser.add_argument("--source-port", type=int, default=48000)
     parser.add_argument("--flow-hit", action="store_true")
     args = parser.parse_args()
+    if args.ipv6_hash:
+        if args.kind not in ("ipv6-udp", "ipv6-tcp", "ipv6-ack"):
+            parser.error("IPv6 hash calibration requires basic IPv6 TCP/UDP")
+        args.output_hash = args.hash_export = True
+    if (args.ipv6_source or args.ipv6_destination) and not args.kind.startswith("ipv6"):
+        parser.error("IPv6 address overrides require an IPv6 fixture")
     if (args.output_hash or args.metadata_loads or args.native_export) and not args.hash_export:
         parser.error("output diagnostics require --hash-export")
     if not 1 <= args.source_port <= 65535:
@@ -112,7 +125,9 @@ def main():
     if args.flow_hit and args.kind != "ipv4-udp":
         parser.error("the installed flow fixture is IPv4 UDP only")
     wire = make_frame(args.mode, args.kind, BOARD("cat /sys/class/net/eth0/address").strip(),
-                      args.flow_hit, args.source_port)
+                      args.flow_hit, args.source_port,
+                      str(args.ipv6_source) if args.ipv6_source else None,
+                      str(args.ipv6_destination) if args.ipv6_destination else None)
     expected = wire if args.mode == "wan" else wire[:12] + bytes.fromhex("8100003e") + wire[12:]
     command = (["sudo", "-n", sys.executable, str(HERE / "inject-trace-frame.py"),
                 "--interface", "en8"] if args.mode == "wan" else
@@ -127,11 +142,12 @@ def main():
     try:
         if args.mode == "lan":
             time.sleep(0.3)
-        output = BOARD("insmod /tmp/rx-ppu-trace.ko pc=561 steps=512 " +
+        output = BOARD(f"insmod /tmp/rx-ppu-trace.ko pc={args.pc} steps=512 " +
                        ("branch_test=1 " if args.branch_test or args.branch_swap else "") +
                        ("rss_map_test=1 " if args.rss_map_test else "") +
                        ("hash_export=1 " if args.hash_export else "") +
                        ("output_hash=1 " if args.output_hash else "") +
+                       ("ipv6_hash=1 " if args.ipv6_hash else "") +
                        ("metadata_loads=1 " if args.metadata_loads else "") +
                        ("native_export=1 " if args.native_export else "") +
                        ("branch_swap=1 " if args.branch_swap else "") + "frame=" + expected.hex() +
@@ -157,6 +173,7 @@ def main():
                       "branch_swap": args.branch_swap,
                       "rss_map_test": args.rss_map_test,
                       "hash_export": args.hash_export, "output_hash": args.output_hash,
+                      "ipv6_hash": args.ipv6_hash,
                       "flow_hit": args.flow_hit,
                       "frame": wire.hex(), "expected_ppu_frame": expected.hex(), "sent": int(sent),
                       "before": before, "after": after,
