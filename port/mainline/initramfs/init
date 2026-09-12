@@ -12,6 +12,18 @@ say() {
 	printf '%s\r\n' "$*"
 }
 
+configure_link_led() {
+	link_led_path=/sys/class/leds/sr1010:$1
+	if [ ! -d "$link_led_path" ]; then
+		say "zxdbg: $1 GPIO LED is unavailable"
+		return
+	fi
+	if ! { echo "$2" > "$link_led_path/device_name" &&
+	       echo 1 > "$link_led_path/link"; }; then
+		say "zxdbg: failed to configure $1 LED trigger"
+	fi
+}
+
 mount_fs() {
 	mkdir -p "$2"
 	mount -t "$1" "$1" "$2" 2>/dev/null || {
@@ -94,6 +106,24 @@ if [ -e /sys/class/net/eth0 ]; then
 	ifconfig eth0
 else
 	say 'eth0 does NOT exist - driver made no netdev (see probe status above)'
+fi
+
+# Link-only indication avoids polling the switch MIB counters for activity.
+configure_link_led wan eth0
+
+# Start each PHY link state machine so an attached LAN cable is detected.
+say '--- enabling LAN ports ---'
+if modprobe tag_zx279133_rtl8372n && modprobe zx279133-rtl8372n; then
+	if ip link set lan-cpu0 up; then
+		for port in lan1 lan2 lan3 lan4; do
+			ip link set "$port" up || say "zxdbg: failed to enable $port"
+			configure_link_led "$port" "$port"
+		done
+	else
+		say 'zxdbg: failed to enable LAN conduit'
+	fi
+else
+	say 'zxdbg: failed to load LAN switch driver'
 fi
 
 cat <<'EOF'

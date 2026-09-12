@@ -28,14 +28,14 @@ def _board_locked(command):
     line = f"printf '\\n{start}\\n'; {command}; printf '\\n{end}\\n'"
     buffer = "nic-" + token
     # Pacing avoids PL011 input overruns when the console prints during a paste.
-    for offset in range(0, len(line), 32):
+    for offset in range(0, len(line), 8):
         # Buffer input also preserves trailing semicolons, which tmux's
         # command-line parser otherwise treats as command separators.
         subprocess.run(["tmux", "load-buffer", "-b", buffer, "-"],
-                       input=line[offset:offset + 32], text=True, check=True)
+                       input=line[offset:offset + 8], text=True, check=True)
         subprocess.run(["tmux", "paste-buffer", "-b", buffer,
                         "-t", PANE, "-d"], check=True)
-        time.sleep(0.01)
+        time.sleep(0.02)
     subprocess.run(["tmux", "send-keys", "-t", PANE, "Enter"], check=True)
     deadline = time.monotonic() + 45
     while time.monotonic() < deadline:
