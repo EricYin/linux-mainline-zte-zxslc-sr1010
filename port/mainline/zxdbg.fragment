@@ -2212,6 +2212,7 @@ CONFIG_ARM_ARCH_TIMER=y
 #
 # end of Xilinx SoC drivers
 
+CONFIG_ZTE_ZX279133_BOOTINFO=y
 # CONFIG_ZTE_ZX279133_PWM_AUDIT is not set
 # CONFIG_ZTE_ZX279133_XPCS_NPPT_AUDIT is not set
 # end of SOC (System On Chip) specific Drivers
