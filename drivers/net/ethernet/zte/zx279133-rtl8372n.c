@@ -7662,7 +7662,10 @@ static int zx279133_rtl8372n_dsa_register(struct device *dev,
 	ds->num_ports = 9;
 	ds->num_lag_ids = RTL8372N_TRUNK_GROUPS;
 	ds->configure_vlan_while_not_filtering = true;
-	ds->fdb_isolation = true;
+	/* FDB/MDB entries share one hardware table without per-port or
+	 * per-bridge databases, so let DSA refcount addresses globally.
+	 */
+	ds->fdb_isolation = false;
 	ds->dscp_prio_mapping_is_global = true;
 	ds->max_num_bridges = RTL8372N_USER_PORT_MAX -
 			      RTL8372N_USER_PORT_MIN + 1;
