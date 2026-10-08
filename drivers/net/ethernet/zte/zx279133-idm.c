@@ -277,12 +277,15 @@ __zx279133_idm_rx_take_buffer(struct zx279133_eth *eth, dma_addr_t dma,
 				if (dma == xsk_buff_xdp_get_dma(buffer->xdp))
 					return true;
 				xsk_buff_free(buffer->xdp);
-			}
-			if (dma == page_pool_get_dma_addr(buffer->page) +
-				   ZX279133_IDM_RX_PAYLOAD_OFFSET)
+			} else if (dma == page_pool_get_dma_addr(buffer->page) +
+					  ZX279133_IDM_RX_PAYLOAD_OFFSET) {
 				return true;
-			zx279133_rx_recycle_page(buffer->page);
+			} else {
+				zx279133_rx_recycle_page(buffer->page);
+			}
+			/* The buffer is released; the caller must not use it. */
 			WARN_ON_ONCE(1);
+			memset(buffer, 0, sizeof(*buffer));
 			return false;
 		}
 		slot = (slot + 1) & (ZX279133_IDM_RX_PAGE_MAP_SIZE - 1);
