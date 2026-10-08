@@ -29,6 +29,7 @@
 #include <linux/ptp_clock_kernel.h>
 #include <linux/slab.h>
 #include <linux/tc_act/tc_csum.h>
+#include <linux/workqueue.h>
 
 #include <net/dsa.h>
 #include <net/dsa_zx279133_rtl8372n.h>
@@ -580,6 +581,11 @@ struct zx279133_rtl8372n {
 	u8 qos_port_profile[9];
 	unsigned int acl_count;
 	unsigned int acl_hw_count;
+	/* MIB access sleeps, so get_stats64 reads a periodically polled copy. */
+	struct delayed_work stats_work;
+	/* Protects stats against concurrent get_stats64 readers. */
+	spinlock_t stats_lock;
+	struct rtnl_link_stats64 stats[RTL8372N_CPU_PORT + 1];
 };
 
 static DEFINE_MUTEX(rtl8372n_phy_driver_lock);
@@ -1688,6 +1694,74 @@ rtl8372n_mib_snapshot(struct zx279133_rtl8372n *priv, unsigned int port,
 	mutex_unlock(&priv->switch_mdiodev->bus->mdio_lock);
 
 	return ret;
+}
+
+#define RTL8372N_STATS_INTERVAL	(3 * HZ)
+
+static const unsigned int rtl8372n_stats64_counters[] = {
+	RTL8372N_MIB_RX_OCTETS,
+	RTL8372N_MIB_TX_OCTETS,
+	RTL8372N_MIB_RX_UCAST,
+	RTL8372N_MIB_RX_MCAST,
+	RTL8372N_MIB_RX_BCAST,
+	RTL8372N_MIB_TX_UCAST,
+	RTL8372N_MIB_TX_MCAST,
+	RTL8372N_MIB_TX_BCAST,
+	RTL8372N_MIB_RX_DISCARDS,
+	RTL8372N_MIB_TX_DISCARDS,
+	RTL8372N_MIB_RX_ERROR,
+	RTL8372N_MIB_TX_ERROR,
+	RTL8372N_MIB_RX_UNDERSIZE,
+	RTL8372N_MIB_RX_OVERSIZE,
+	RTL8372N_MIB_RX_FRAGMENTS,
+	RTL8372N_MIB_RX_JABBERS,
+	RTL8372N_MIB_RX_CRC_ALIGN,
+	RTL8372N_MIB_TX_COLLISIONS,
+	RTL8372N_MIB_TX_LATE_COLLISION,
+	RTL8372N_MIB_TX_EXCESS_COLLISION,
+};
+
+static void rtl8372n_stats_poll_port(struct zx279133_rtl8372n *priv,
+				     unsigned int port)
+{
+	u64 value[ARRAY_SIZE(rtl8372n_stats64_counters)];
+	struct rtnl_link_stats64 stats = {};
+
+	if (rtl8372n_mib_snapshot(priv, port, rtl8372n_stats64_counters, value,
+				  ARRAY_SIZE(rtl8372n_stats64_counters)))
+		return;
+
+	stats.rx_bytes = value[0];
+	stats.tx_bytes = value[1];
+	stats.rx_packets = value[2] + value[3] + value[4];
+	stats.tx_packets = value[5] + value[6] + value[7];
+	stats.multicast = value[3];
+	stats.rx_dropped = value[8];
+	stats.tx_dropped = value[9];
+	stats.rx_errors = value[10];
+	stats.tx_errors = value[11];
+	stats.rx_length_errors = value[12] + value[13] + value[14] + value[15];
+	stats.rx_crc_errors = value[16];
+	stats.collisions = value[17];
+	stats.tx_window_errors = value[18];
+	stats.tx_aborted_errors = value[19];
+
+	spin_lock_bh(&priv->stats_lock);
+	priv->stats[port] = stats;
+	spin_unlock_bh(&priv->stats_lock);
+}
+
+static void rtl8372n_stats_work(struct work_struct *work)
+{
+	struct zx279133_rtl8372n *priv =
+		container_of(to_delayed_work(work), struct zx279133_rtl8372n,
+			     stats_work);
+	struct dsa_port *dp;
+
+	dsa_switch_for_each_available_port(dp, priv->ds)
+		rtl8372n_stats_poll_port(priv, dp->index);
+
+	schedule_delayed_work(&priv->stats_work, RTL8372N_STATS_INTERVAL);
 }
 
 static int rtl8372n_phy_wait_ready(struct mdio_device *mdiodev)
@@ -3644,6 +3718,7 @@ static int zx279133_rtl8372n_setup(struct dsa_switch *ds)
 		ptp_ret = rtl8372n_ptp_clock_init(priv);
 		if (ptp_ret && ptp_ret != -EOPNOTSUPP)
 			dev_warn(ds->dev, "RTL8372N PHC disabled: %d\n", ptp_ret);
+		schedule_delayed_work(&priv->stats_work, 0);
 	}
 	return ret;
 }
@@ -3652,6 +3727,7 @@ static void zx279133_rtl8372n_teardown(struct dsa_switch *ds)
 {
 	struct zx279133_rtl8372n *priv = ds->priv;
 
+	cancel_delayed_work_sync(&priv->stats_work);
 	rtl8372n_ptp_clock_teardown(priv);
 	rtl8372n_mdio_teardown(ds);
 	mutex_lock(&priv->switch_mdiodev->bus->mdio_lock);
@@ -7230,50 +7306,14 @@ static void zx279133_rtl8372n_get_ethtool_stats(struct dsa_switch *ds,
 static void zx279133_rtl8372n_get_stats64(struct dsa_switch *ds, int port,
 					   struct rtnl_link_stats64 *stats)
 {
-	static const unsigned int counters[] = {
-		RTL8372N_MIB_RX_OCTETS,
-		RTL8372N_MIB_TX_OCTETS,
-		RTL8372N_MIB_RX_UCAST,
-		RTL8372N_MIB_RX_MCAST,
-		RTL8372N_MIB_RX_BCAST,
-		RTL8372N_MIB_TX_UCAST,
-		RTL8372N_MIB_TX_MCAST,
-		RTL8372N_MIB_TX_BCAST,
-		RTL8372N_MIB_RX_DISCARDS,
-		RTL8372N_MIB_TX_DISCARDS,
-		RTL8372N_MIB_RX_ERROR,
-		RTL8372N_MIB_TX_ERROR,
-		RTL8372N_MIB_RX_UNDERSIZE,
-		RTL8372N_MIB_RX_OVERSIZE,
-		RTL8372N_MIB_RX_FRAGMENTS,
-		RTL8372N_MIB_RX_JABBERS,
-		RTL8372N_MIB_RX_CRC_ALIGN,
-		RTL8372N_MIB_TX_COLLISIONS,
-		RTL8372N_MIB_TX_LATE_COLLISION,
-		RTL8372N_MIB_TX_EXCESS_COLLISION,
-	};
 	struct zx279133_rtl8372n *priv = ds->priv;
-	u64 value[ARRAY_SIZE(counters)];
 
-	if (rtl8372n_mib_snapshot(priv, port, counters, value,
-				   ARRAY_SIZE(counters)))
+	if (port < 0 || port > RTL8372N_CPU_PORT)
 		return;
 
-	stats->rx_bytes = value[0];
-	stats->tx_bytes = value[1];
-	stats->rx_packets = value[2] + value[3] + value[4];
-	stats->tx_packets = value[5] + value[6] + value[7];
-	stats->multicast = value[3];
-	stats->rx_dropped = value[8];
-	stats->tx_dropped = value[9];
-	stats->rx_errors = value[10];
-	stats->tx_errors = value[11];
-	stats->rx_length_errors = value[12] + value[13] + value[14] +
-				  value[15];
-	stats->rx_crc_errors = value[16];
-	stats->collisions = value[17];
-	stats->tx_window_errors = value[18];
-	stats->tx_aborted_errors = value[19];
+	spin_lock(&priv->stats_lock);
+	*stats = priv->stats[port];
+	spin_unlock(&priv->stats_lock);
 }
 
 static void
@@ -7655,6 +7695,8 @@ static int zx279133_rtl8372n_probe(struct platform_device *pdev)
 	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv)
 		return -ENOMEM;
+	spin_lock_init(&priv->stats_lock);
+	INIT_DELAYED_WORK(&priv->stats_work, rtl8372n_stats_work);
 
 	priv->service = dev_get_drvdata(dev->parent);
 	if (!priv->service)
