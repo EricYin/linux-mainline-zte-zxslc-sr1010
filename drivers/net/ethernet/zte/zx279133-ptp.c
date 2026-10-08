@@ -2,6 +2,7 @@
 
 #include <linux/bitfield.h>
 #include <linux/delay.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 
 #include "zx279133.h"
@@ -87,11 +88,51 @@ static int zx279133_ptp_settime64(struct ptp_clock_info *info,
 	return 0;
 }
 
+static int zx279133_ptp_adjtime(struct ptp_clock_info *info, s64 delta)
+{
+	struct zx279133_eth *eth = container_of(info, struct zx279133_eth,
+					       ptp_info);
+	unsigned long flags;
+	u64 sec;
+	u32 nsec;
+	s64 ns;
+
+	mutex_lock(&eth->ptp_cmd_lock);
+	spin_lock_irqsave(&eth->ptp_lock, flags);
+	if (!eth->ptp_agc_prepared) {
+		spin_unlock_irqrestore(&eth->ptp_lock, flags);
+		mutex_unlock(&eth->ptp_cmd_lock);
+		return -ENETDOWN;
+	}
+	ns = zx279133_ptp_read_time(eth);
+	spin_unlock_irqrestore(&eth->ptp_lock, flags);
+
+	ns += delta;
+	sec = ns < 0 ? 0 : div_u64_rem(ns, NSEC_PER_SEC, &nsec);
+	if (ns < 0 || sec > U32_MAX) {
+		mutex_unlock(&eth->ptp_cmd_lock);
+		return -ERANGE;
+	}
+	/* The TOD has no offset register; stage the adjusted absolute time. */
+	zx279133_ptp_issue_update(eth, sec, nsec);
+	mutex_unlock(&eth->ptp_cmd_lock);
+
+	return 0;
+}
+
+static int zx279133_ptp_adjfine(struct ptp_clock_info *info, long scaled_ppm)
+{
+	/* The TOD oscillator cannot be trimmed; accept only a zero offset. */
+	return scaled_ppm ? -EOPNOTSUPP : 0;
+}
+
 static const struct ptp_clock_info zx279133_ptp_info = {
 	.owner		= THIS_MODULE,
 	.name		= "zx279133-tod",
 	/* The recovered compare register does not trim the TOD oscillator. */
 	.max_adj	= 0,
+	.adjfine	= zx279133_ptp_adjfine,
+	.adjtime	= zx279133_ptp_adjtime,
 	.gettimex64	= zx279133_ptp_gettimex64,
 	.settime64	= zx279133_ptp_settime64,
 };
