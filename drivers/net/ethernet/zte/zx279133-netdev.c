@@ -104,6 +104,10 @@ static bool zx279133_shared_tx_pause(struct zx279133_eth *eth)
 	 * completion reclaim cannot wake one between the two disable calls.
 	 */
 	WRITE_ONCE(eth->tx_stopping, true);
+	/* XDP and XSK producers test tx_stopping before taking tx_lock from
+	 * softirq context; wait for any that passed the test to finish.
+	 */
+	synchronize_net();
 	if (netif_running(eth->ndev))
 		netif_tx_disable(eth->ndev);
 	if (eth->lan_ndev && netif_running(eth->lan_ndev))
