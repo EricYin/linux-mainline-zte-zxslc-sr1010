@@ -115,6 +115,10 @@ static int zx279133_wdt_set_timeout(struct watchdog_device *wdd,
 	int ret;
 
 	wdd->timeout = timeout;
+	/* A stopped watchdog applies the new timeout on its next start. */
+	if (!watchdog_active(wdd) && !watchdog_hw_running(wdd))
+		return 0;
+
 	ret = zx279133_wdt_start(wdd);
 	if (!ret) {
 		/* The first core ping must not race the hardware reload sequence. */
