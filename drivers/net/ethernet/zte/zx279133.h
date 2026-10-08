@@ -678,6 +678,10 @@ struct zx279133_eth {
 	struct mutex xmac_lock;
 	/* Serializes ownership of the shared NPPT/IDM datapath. */
 	struct mutex datapath_lock;
+	/* Serializes multi-register NP indirect table accesses. */
+	struct mutex np_ind_lock;
+	/* Serializes read-modify-write of shared WANID table entries. */
+	struct mutex wanid_lock;
 	struct napi_struct napi;
 	struct napi_struct lan_napi;
 	struct delayed_work tx_reclaim_work;

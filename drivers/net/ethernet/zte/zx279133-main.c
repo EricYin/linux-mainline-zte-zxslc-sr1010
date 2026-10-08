@@ -275,6 +275,8 @@ static int zx279133_eth_probe(struct platform_device *pdev)
 			  zx279133_idm_rx_refill_work);
 	mutex_init(&eth->xmac_lock);
 	mutex_init(&eth->datapath_lock);
+	mutex_init(&eth->np_ind_lock);
+	mutex_init(&eth->wanid_lock);
 	for (i = 0; i < ZX279133_CPU_TX_QUEUES; i++) {
 		eth->tx[i].slots = devm_kcalloc(dev, ZX279133_IDM_TX_DEPTH,
 						sizeof(*eth->tx[i].slots),

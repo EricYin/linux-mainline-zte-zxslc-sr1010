@@ -208,8 +208,8 @@ static void zx279133_ppu_cluster_runtime_restore(struct zx279133_eth *eth)
 	eth->ppu_cluster_runtime_prepared = false;
 }
 
-static int zx279133_spa_indirect_write(struct zx279133_eth *eth, u32 mem_id,
-				       u32 addr, u32 value)
+static int __zx279133_spa_indirect_write(struct zx279133_eth *eth, u32 mem_id,
+					 u32 addr, u32 value)
 {
 	u32 gate, status;
 	int ret;
@@ -238,8 +238,20 @@ out:
 	return ret;
 }
 
-static int zx279133_spa_indirect_read(struct zx279133_eth *eth, u32 mem_id,
-				      u32 addr, u32 *value)
+static int zx279133_spa_indirect_write(struct zx279133_eth *eth, u32 mem_id,
+				       u32 addr, u32 value)
+{
+	int ret;
+
+	mutex_lock(&eth->np_ind_lock);
+	ret = __zx279133_spa_indirect_write(eth, mem_id, addr, value);
+	mutex_unlock(&eth->np_ind_lock);
+
+	return ret;
+}
+
+static int __zx279133_spa_indirect_read(struct zx279133_eth *eth, u32 mem_id,
+					u32 addr, u32 *value)
 {
 	u32 gate, status;
 	int ret;
@@ -275,6 +287,18 @@ out:
 	return ret;
 }
 
+static int zx279133_spa_indirect_read(struct zx279133_eth *eth, u32 mem_id,
+				      u32 addr, u32 *value)
+{
+	int ret;
+
+	mutex_lock(&eth->np_ind_lock);
+	ret = __zx279133_spa_indirect_read(eth, mem_id, addr, value);
+	mutex_unlock(&eth->np_ind_lock);
+
+	return ret;
+}
+
 /*
  * SE SMMU0 indirect RAM access, recovered from np.ko se_smmu0_read()/
  * se_smmu0_write(): address, four data words and command live in the PPS
@@ -292,8 +316,8 @@ static int zx279133_smmu0_wait(struct zx279133_eth *eth)
 					 1, 1000);
 }
 
-static int zx279133_smmu0_read(struct zx279133_eth *eth, u32 addr_ind,
-			       u32 *data, u32 words, u32 cmd)
+static int __zx279133_smmu0_read(struct zx279133_eth *eth, u32 addr_ind,
+				 u32 *data, u32 words, u32 cmd)
 {
 	u32 agclk = readl(eth->pps_base + ZX279133_PPU_AGCLK_CFG) &
 		    ZX279133_AGCLK_VALUE_MASK;
@@ -332,8 +356,20 @@ out:
 	return ret;
 }
 
-static int zx279133_smmu0_write(struct zx279133_eth *eth, u32 addr_ind,
-				const u32 *data, u32 words, u32 cmd)
+static int zx279133_smmu0_read(struct zx279133_eth *eth, u32 addr_ind,
+			       u32 *data, u32 words, u32 cmd)
+{
+	int ret;
+
+	mutex_lock(&eth->np_ind_lock);
+	ret = __zx279133_smmu0_read(eth, addr_ind, data, words, cmd);
+	mutex_unlock(&eth->np_ind_lock);
+
+	return ret;
+}
+
+static int __zx279133_smmu0_write(struct zx279133_eth *eth, u32 addr_ind,
+				  const u32 *data, u32 words, u32 cmd)
 {
 	u32 agclk = readl(eth->pps_base + ZX279133_PPU_AGCLK_CFG) &
 		    ZX279133_AGCLK_VALUE_MASK;
@@ -364,6 +400,18 @@ out:
 	if (agclk == 1)
 		writel(readl(eth->pps_base + ZX279133_PPU_AGCLK_CFG) | BIT(0),
 		       eth->pps_base + ZX279133_PPU_AGCLK_CFG);
+
+	return ret;
+}
+
+static int zx279133_smmu0_write(struct zx279133_eth *eth, u32 addr_ind,
+				const u32 *data, u32 words, u32 cmd)
+{
+	int ret;
+
+	mutex_lock(&eth->np_ind_lock);
+	ret = __zx279133_smmu0_write(eth, addr_ind, data, words, cmd);
+	mutex_unlock(&eth->np_ind_lock);
 
 	return ret;
 }
@@ -412,9 +460,9 @@ void zx279133_program_spa_cpu_mac(struct zx279133_eth *eth, const u8 *addr)
 	}
 }
 
-static int zx279133_program_one_wanid_cpu_mac(struct zx279133_eth *eth,
-					      unsigned int wanid,
-					      const u8 *addr)
+static int __zx279133_program_one_wanid_cpu_mac(struct zx279133_eth *eth,
+						unsigned int wanid,
+						const u8 *addr)
 {
 	u32 data[4];
 	int ret;
@@ -427,6 +475,19 @@ static int zx279133_program_one_wanid_cpu_mac(struct zx279133_eth *eth,
 	data[3] = (data[3] & ~GENMASK(15, 0)) | get_unaligned_be16(addr);
 	return zx279133_smmu0_write(eth, (16386 + wanid) << 7, data, 4,
 				    ZX279133_SMMU0_CMD_WRITE);
+}
+
+static int zx279133_program_one_wanid_cpu_mac(struct zx279133_eth *eth,
+					      unsigned int wanid,
+					      const u8 *addr)
+{
+	int ret;
+
+	mutex_lock(&eth->wanid_lock);
+	ret = __zx279133_program_one_wanid_cpu_mac(eth, wanid, addr);
+	mutex_unlock(&eth->wanid_lock);
+
+	return ret;
 }
 
 int zx279133_program_wanid_cpu_mac(struct zx279133_eth *eth, const u8 *addr)
@@ -446,8 +507,8 @@ int zx279133_program_wanid_cpu_mac(struct zx279133_eth *eth, const u8 *addr)
 	return zx279133_program_one_wanid_cpu_mac(eth, 16, addr);
 }
 
-int zx279133_program_wanid_sip(struct zx279133_eth *eth, u32 wanid,
-			       u32 sip, u32 *old_sip)
+static int __zx279133_program_wanid_sip(struct zx279133_eth *eth, u32 wanid,
+					u32 sip, u32 *old_sip)
 {
 	u32 data[ZX279133_SMMU0_WORDS];
 	int ret;
@@ -465,12 +526,24 @@ int zx279133_program_wanid_sip(struct zx279133_eth *eth, u32 wanid,
 				    ARRAY_SIZE(data), ZX279133_SMMU0_CMD_WRITE);
 }
 
+int zx279133_program_wanid_sip(struct zx279133_eth *eth, u32 wanid,
+			       u32 sip, u32 *old_sip)
+{
+	int ret;
+
+	mutex_lock(&eth->wanid_lock);
+	ret = __zx279133_program_wanid_sip(eth, wanid, sip, old_sip);
+	mutex_unlock(&eth->wanid_lock);
+
+	return ret;
+}
+
 #define ZX279133_WANID_PPPOE_SID	GENMASK(31, 16)
 #define ZX279133_WANID_PPPOE_MODE	GENMASK(27, 26)
 
-int zx279133_program_wanid_pppoe(struct zx279133_eth *eth, u32 wanid,
-				 u8 mode, u16 sid, u8 *old_mode,
-				 u16 *old_sid)
+static int __zx279133_program_wanid_pppoe(struct zx279133_eth *eth, u32 wanid,
+					  u8 mode, u16 sid, u8 *old_mode,
+					  u16 *old_sid)
 {
 	u32 data[ZX279133_SMMU0_WORDS];
 	int ret;
@@ -492,6 +565,19 @@ int zx279133_program_wanid_pppoe(struct zx279133_eth *eth, u32 wanid,
 
 	return zx279133_smmu0_write(eth, (16386 + wanid) << 7, data,
 				    ARRAY_SIZE(data), ZX279133_SMMU0_CMD_WRITE);
+}
+
+int zx279133_program_wanid_pppoe(struct zx279133_eth *eth, u32 wanid,
+				 u8 mode, u16 sid, u8 *old_mode,
+				 u16 *old_sid)
+{
+	int ret;
+
+	mutex_lock(&eth->wanid_lock);
+	ret = __zx279133_program_wanid_pppoe(eth, wanid, mode, sid, old_mode, old_sid);
+	mutex_unlock(&eth->wanid_lock);
+
+	return ret;
 }
 
 #define ZX279133_FAST_IKEY_BASE_BLOCK	23186
