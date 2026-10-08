@@ -2732,7 +2732,8 @@ static int rtl8372n_mdio_read_c45(struct mii_bus *bus, int port, int devad,
 	    port > RTL8372N_USER_PORT_MAX)
 		return -EOPNOTSUPP;
 
-	mutex_lock(&priv->switch_mdiodev->bus->mdio_lock);
+	mutex_lock_nested(&priv->switch_mdiodev->bus->mdio_lock,
+			  MDIO_MUTEX_NESTED);
 	ret = rtl8372n_phy_read(priv->switch_mdiodev, port, devad, regnum,
 				&value);
 	mutex_unlock(&priv->switch_mdiodev->bus->mdio_lock);
@@ -2751,7 +2752,8 @@ static int rtl8372n_mdio_write_c45(struct mii_bus *bus, int port, int devad,
 	    port > RTL8372N_USER_PORT_MAX)
 		return -EOPNOTSUPP;
 
-	mutex_lock(&priv->switch_mdiodev->bus->mdio_lock);
+	mutex_lock_nested(&priv->switch_mdiodev->bus->mdio_lock,
+			  MDIO_MUTEX_NESTED);
 	ret = rtl8372n_phy_write(priv->switch_mdiodev, BIT(port), devad,
 				 regnum, value);
 	mutex_unlock(&priv->switch_mdiodev->bus->mdio_lock);
