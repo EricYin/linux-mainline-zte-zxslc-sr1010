@@ -8,6 +8,17 @@ config ZTE_ZX279133_BOOTINFO
 	  in /chosen/versioninfo. Expose the selected firmware slot and its
 	  flash offsets without changing the MTD partition layout.
 
+config ZTE_ZX279133_ROOTFS
+	bool "ZTE ZX279133 firmware slot root filesystem"
+	depends on ZTE_ZX279133_BOOTINFO && MTD
+	help
+	  Register a read-only MTD device named "rootfs" covering the root
+	  filesystem payload of the SR1010 firmware slot selected by the vendor
+	  bootloader. Bad erase blocks skipped by the vendor flasher are skipped
+	  here as well, so a block filesystem such as squashfs can be mounted
+	  through mtdblock. The device only exists when the bootloader reports
+	  a selected slot with a non-empty rootfs.
+
 config ZTE_ZX279133_PWM_AUDIT
 	tristate "ZTE ZX279133 PWM read-only audit"
 	depends on ARM64 && COMMON_CLK && OF && HAS_IOMEM
