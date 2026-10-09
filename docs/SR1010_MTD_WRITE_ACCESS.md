@@ -67,3 +67,31 @@ The SPI-NAND DT schema check and relevant `git diff --check` passed. WAN ping
 passed 3/3 (`out/mtd-rw-ping.log`), kernel taint is zero, and both temporary
 JFFS2 mounts have been removed. Generated images and runtime logs are not
 included in the source commits; no remote push was requested.
+
+## Update 2026-10-09: JFFS2 writes on the Plugin partition
+
+The first real writes on mainline, from OpenWrt on the device, showed that
+JFFS2 cannot be used on this NAND as it is. After the partition was erased,
+mounted, written with 300 KB, synced and unmounted, the next mount stopped at
+the first block that held data:
+
+```
+jffs2: cannot read OOB for EB at 02740000, requested 8 bytes, read 8 bytes, error -74
+```
+
+-74 is -EBADMSG, an uncorrectable ECC error, and `ecc_failures` of the mtd
+device counts it. JFFS2 writes the clean marker of an erased block into the OOB
+of the first page and later writes the first node into the same page; the
+on-die ECC of the W25N01KV (ID ef ae 21) is generated again at each program of
+a page, which is the likely reason that such a page cannot be read back. This
+is an inference from the symptom, not from a datasheet.
+
+Kernel commit `0c3602121` adds `mtd_info.program_once`, set by SPI-NAND with
+on-die ECC, and makes JFFS2 keep a page-sized clean marker in the data for such
+a device, so no page is programmed twice. With it the same test passes and the
+overlay in the Plugin partition keeps the settings over a reboot. Details,
+checks and the effect on the vendor firmware, which shares the partition:
+`target/linux/zte/docs/jffs2-on-spi-nand.md` in the ImmortalWrt tree.
+
+Not checked: power loss during writes, long runs, and the vendor firmware
+reading a Plugin partition written this way.
