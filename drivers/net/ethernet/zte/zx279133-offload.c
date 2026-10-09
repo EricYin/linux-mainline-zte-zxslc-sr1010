@@ -826,9 +826,21 @@ zx279133_flow_parse(struct zx279133_flow_offload *offload,
 	}
 
 	if (!odev || !is_valid_ether_addr(data->eth.h_source) ||
-	    !is_valid_ether_addr(data->eth.h_dest) ||
-	    !ether_addr_equal(data->eth.h_source, offload->eth->ndev->dev_addr))
+	    !is_valid_ether_addr(data->eth.h_dest))
 		return -EOPNOTSUPP;
+	/*
+	 * A flow entry holds the destination MAC only. The hardware takes the
+	 * source MAC of every routed frame from the WANID table, and that is the
+	 * WAN MAC in both directions, so a flow that needs another source MAC
+	 * would leave with the wrong one. Refuse it and say why, because the
+	 * packets then silently take the software path.
+	 */
+	if (!ether_addr_equal(data->eth.h_source, offload->eth->ndev->dev_addr)) {
+		dev_warn_once(offload->eth->dev,
+			      "flow offload refused: source MAC %pM is not the WAN MAC %pM, and the hardware sends only the WAN MAC; give the LAN the WAN address\n",
+			      data->eth.h_source, offload->eth->ndev->dev_addr);
+		return -EOPNOTSUPP;
+	}
 	egress = zx279133_flow_dev_port(offload->eth, odev);
 	if ((*ingress == ZX279133_FLOW_PORT_LAN &&
 	     egress != ZX279133_FLOW_PORT_WAN) ||
