@@ -2,6 +2,11 @@
 
 Date: 2026-09-13
 
+> **Superseded for the LAN address on 2026-10-09.** The LAN conduit no longer
+> reads tag `0x0101`; it keeps the WAN address, and the switch ports and the
+> bridge inherit that. See [Policy change](#policy-change-one-address-for-wan-and-lan).
+> The split-address results below are historical.
+
 ## Result
 
 The mainline WAN driver obtains its MAC automatically from tag `0x0100`
@@ -131,3 +136,48 @@ unload it. Its build products are cleaned from the source directory.
 
 Source, configuration, and acceptance tools are committed separately from
 generated images and unrelated bootinfo work. No remote push was requested.
+
+
+## Policy change: one address for WAN and LAN
+
+2026-10-09. The split addresses (WAN `0x0100`, LAN `0x0101`) kept every
+WAN-to-LAN flow off the hardware NAT.
+
+**Cause.** A flow entry has no source MAC field: only the destination MAC is
+stored (bytes 8 to 13 of the 32-byte fast data). The hardware takes the source
+MAC of a routed frame from the WANID table, field `m_cpumac`, which the driver
+sets to the WAN address for both directions (WANID 0 upstream, WANID 16
+downstream). The factory driver does the same: `wanid_set_mac(n, mac)` writes
+one MAC to entry `n` and to entry `n + 16`. `zx279133_flow_parse()` therefore
+requires the source MAC of the rewritten Ethernet header to equal the WAN MAC.
+For LAN-to-WAN the egress device is the WAN, so it passes. For WAN-to-LAN the
+egress device is the bridge with the LAN address, so it failed and the flow
+stayed on the software path.
+
+**Measurement** (user, WAN download, same board):
+
+| MAC setup | Download | CPU0 / CPU1 softirq | Hardware flows |
+| --- | ---: | ---: | --- |
+| split addresses | 945 Mbit/s | 97.6% / 0% | upstream only |
+| one address (temporary) | 947 Mbit/s | 0% / 0.2% | both directions, hit counts grow |
+| split addresses again | 924 Mbit/s | 56.5% / 58.5% | upstream only |
+
+With one address, WAN packets entering the CPU during 12 seconds fell from
+about 970000 to 204. The WAN link is 1 Gbit/s, so the gain shows as CPU load,
+not as speed.
+
+**Factory.** The runtime capture in `vendor-reference/sr1010-vendor-runtime`
+shows `br0`, `eth0` to `eth4` and `nbif0` all on `7c:7d:21:b9:c1:3a`.
+
+**Change.** `zx279133-sr1010.dts` no longer gives `lan_cpu` an `nvmem-cells`
+property. `zx279133_lan_netdev_setup()` already starts the conduit on the WAN
+address, so the conduit, the four DSA ports and the bridge use it. The
+`factory_lan_mac` cell is still defined and still validated by the layout
+driver, which checks both tags before publishing either cell, so a board that
+wants a separate LAN address can use it again. The offload check is unchanged
+but now reports the first refusal in the kernel log, with both addresses.
+
+**Not covered.** PPPoE and IPv6 flows go through the same check and are no
+longer refused for their source MAC; neither was tested on the device for
+this change. Bridging the WAN into the LAN would put one address on one
+segment.
