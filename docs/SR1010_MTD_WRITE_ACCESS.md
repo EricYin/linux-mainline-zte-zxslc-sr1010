@@ -115,3 +115,13 @@ its end. The scan now reads 1 KB after the marker and takes 0.24 s.
 
 Details: `target/linux/zte/docs/spi-nand-speed.md` and
 `target/linux/zte/docs/jffs2-on-spi-nand.md` in the ImmortalWrt tree.
+
+## Update 2026-10-09 (later): the vendor kernel refuses the JFFS2 that OpenWrt wrote
+
+After OpenWrt had used the Plugin partition, the vendor firmware (5.4.196) could not mount
+it: `jffs2: Incompatible feature node (0xe008) found at offset 0x01642070`, then an I/O
+error. 0xe008 is a JFFS2 xattr node; overlayfs writes extended attributes when the upper
+file system supports them. The vendor JFFS2 has neither xattr nor summary support. The
+ImmortalWrt target now builds JFFS2 without both. The partition has to be erased once
+after upgrading from an earlier build. Mounting a partition written by the new build from
+the vendor firmware, and the way back, have not been tried yet.
