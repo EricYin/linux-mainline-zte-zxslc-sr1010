@@ -266,6 +266,8 @@
 	flash@0 {
 		partitions-only;
 		spi-max-frequency = <50000000>;
+		/* Read with four data lines (6Bh); the commands and addresses stay on one. */
+		spi-rx-bus-width = <4>;
 
 		partitions {
 			partition@100000 {
