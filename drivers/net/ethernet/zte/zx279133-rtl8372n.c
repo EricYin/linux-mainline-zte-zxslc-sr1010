@@ -6955,20 +6955,30 @@ static void zx279133_rtl8372n_phylink_get_caps(struct dsa_switch *ds,
 					       int port,
 					       struct phylink_config *config)
 {
+	/*
+	 * No pause capabilities, on purpose. The switch applies whatever its PHY
+	 * negotiates and the driver has no mac_link_up to say otherwise, so the
+	 * only control is what the PHY advertises, and phylink clears pause from
+	 * the advertisement when the MAC does not claim it. With pause negotiated,
+	 * the switch answers a full queue towards the CPU port by pausing the
+	 * client, and a multi-flow upload on a 2.5G port settled at about
+	 * 0.95 Gbit/s with some 25000 PAUSE frames per five seconds. With pause
+	 * off the same test reaches about 2.22 Gbit/s, 94% of what TCP can carry
+	 * on 2.5G. PAUSE is also per port: one stalled CPU port would stop every
+	 * LAN client. The WAN MAC does the same, matching the factory runtime.
+	 */
 	if (port >= RTL8372N_USER_PORT_MIN &&
 	    port <= RTL8372N_USER_PORT_MAX) {
 		__set_bit(PHY_INTERFACE_MODE_INTERNAL,
 			  config->supported_interfaces);
 		config->mac_capabilities = MAC_10 | MAC_100 | MAC_1000FD |
-					   MAC_2500FD | MAC_SYM_PAUSE |
-					   MAC_ASYM_PAUSE;
+					   MAC_2500FD;
 		config->lpi_capabilities = MAC_100FD | MAC_1000FD |
 					   MAC_2500FD;
 	} else if (port == 8) {
 		__set_bit(PHY_INTERFACE_MODE_10GBASER,
 			  config->supported_interfaces);
-		config->mac_capabilities = MAC_10000FD | MAC_SYM_PAUSE |
-					   MAC_ASYM_PAUSE;
+		config->mac_capabilities = MAC_10000FD;
 	}
 }
 
