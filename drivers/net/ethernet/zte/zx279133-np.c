@@ -932,36 +932,23 @@ static int zx279133_spa_pkt_type_runtime(struct zx279133_eth *eth)
 	return 0;
 }
 
-int zx279133_wan_port_bringup(struct zx279133_eth *eth)
+/*
+ * LAN-side PPU state: the ingress start PC of the RTL8372N path, the protocol
+ * action tables of the LAN ports and the SPA attributes of their memories.
+ *
+ * The LAN carries traffic whether or not the WAN has a link, so this belongs
+ * to the shared data path and is programmed before RX is enabled. It used to
+ * be done by the WAN link-up. With no WAN link the LAN then stayed on the
+ * factory defaults (entry PC 10, empty protocol tables), and every LAN frame
+ * went through the default path to queue 0 and CPU0. The entry PC, the
+ * protocol tables and the attributes belong together: the PC 561 program
+ * relies on the tables, so none of them can be moved on its own.
+ */
+static int zx279133_lan_port_bringup(struct zx279133_eth *eth)
 {
 	u32 reg;
 	int ret;
 
-	/*
-	 * The vendor runtime (switch.ko port init) programs the CPU port
-	 * memory 0 with Tbl Vld + start Pc 561 (SPA address 0 = 0x463,
-	 * observed on the factory system); the start-PC copy below then
-	 * propagates it to the WAN port. The switch-side UNI 5 maps to PPU
-	 * port and SPA memory 6 (getPort(5) = 6). The factory's final
-	 * memory-5 LAN state remains address 0 = 0x8015 (Pc 10, flow 1),
-	 * address 10 = 0x01F4000C and address 19 = 0x42000.
-	 * Forcing start-PC 0 to match vendor ODMA start_pc broke even 56-byte
-	 * RX; ODMA start_pc=0 is post-PPU, not the ingress SPA start.
-	 */
-	ret = zx279133_spa_indirect_read(eth, 0, 0, &reg);
-	if (ret)
-		return ret;
-	reg = (reg & ~GENMASK(23, 0)) | 0x463;
-	ret = zx279133_spa_indirect_write(eth, 0, 0, reg);
-	if (ret)
-		return ret;
-	ret = zx279133_spa_indirect_write(eth, 0, 10, 0x01f4000c);
-	if (ret)
-		return ret;
-
-	ret = zx279133_mf_port_startpc_copy(eth, 6, 0);
-	if (ret)
-		return ret;
 	/*
 	 * RTL8372N strips the private transport VLAN before XMAC0.  Its real
 	 * ingress path is SPA memory 5, so use the ordinary-Ethernet entry PC;
@@ -974,9 +961,10 @@ int zx279133_wan_port_bringup(struct zx279133_eth *eth)
 	ret = zx279133_spa_indirect_write(eth, 5, 0, reg);
 	if (ret)
 		return ret;
+
 	/*
 	 * RTL8372N ingress reaches the PPU through port 0; ports 5 and 10 cover
-	 * the CPU-facing and companion LAN paths. Retain the WAN image on port 6.
+	 * the CPU-facing and companion LAN paths.
 	 */
 	ret = zx279133_proto_table_write(eth, ZX279133_LAN_INGRESS_PPU_PORT,
 					 zx279133_lan_proto_table);
@@ -984,10 +972,6 @@ int zx279133_wan_port_bringup(struct zx279133_eth *eth)
 		return ret;
 	ret = zx279133_proto_table_write(eth, ZX279133_LAN_PPU_PORT,
 					 zx279133_lan_proto_table);
-	if (ret)
-		return ret;
-	ret = zx279133_proto_table_write(eth, ZX279133_WAN_PPU_PORT,
-					 zx279133_wan_proto_table);
 	if (ret)
 		return ret;
 	ret = zx279133_proto_table_write(eth, ZX279133_LAN_COMPANION_PORT,
@@ -1029,6 +1013,44 @@ int zx279133_wan_port_bringup(struct zx279133_eth *eth)
 	if (ret)
 		return ret;
 	ret = zx279133_mf_eram_attr_set(eth, 5, 0x00042000);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
+int zx279133_wan_port_bringup(struct zx279133_eth *eth)
+{
+	u32 reg;
+	int ret;
+
+	/*
+	 * The vendor runtime (switch.ko port init) programs the CPU port
+	 * memory 0 with Tbl Vld + start Pc 561 (SPA address 0 = 0x463,
+	 * observed on the factory system); the start-PC copy below then
+	 * propagates it to the WAN port. The switch-side UNI 5 maps to PPU
+	 * port and SPA memory 6 (getPort(5) = 6). The factory's final
+	 * memory-5 LAN state remains address 0 = 0x8015 (Pc 10, flow 1),
+	 * address 10 = 0x01F4000C and address 19 = 0x42000.
+	 * Forcing start-PC 0 to match vendor ODMA start_pc broke even 56-byte
+	 * RX; ODMA start_pc=0 is post-PPU, not the ingress SPA start.
+	 */
+	ret = zx279133_spa_indirect_read(eth, 0, 0, &reg);
+	if (ret)
+		return ret;
+	reg = (reg & ~GENMASK(23, 0)) | 0x463;
+	ret = zx279133_spa_indirect_write(eth, 0, 0, reg);
+	if (ret)
+		return ret;
+	ret = zx279133_spa_indirect_write(eth, 0, 10, 0x01f4000c);
+	if (ret)
+		return ret;
+
+	ret = zx279133_mf_port_startpc_copy(eth, 6, 0);
+	if (ret)
+		return ret;
+	ret = zx279133_proto_table_write(eth, ZX279133_WAN_PPU_PORT,
+					 zx279133_wan_proto_table);
 	if (ret)
 		return ret;
 
@@ -2156,6 +2178,9 @@ int zx279133_np_prepare(struct zx279133_eth *eth)
 	zx279133_sdet_prepare(eth);
 	zx279133_sipc_final_prepare(eth);
 	ret = zx279133_mf_port_ppuinit(eth);
+	if (ret)
+		goto err_route_off;
+	ret = zx279133_lan_port_bringup(eth);
 	if (ret)
 		goto err_route_off;
 
