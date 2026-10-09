@@ -95,3 +95,23 @@ checks and the effect on the vendor firmware, which shares the partition:
 
 Not checked: power loss during writes, long runs, and the vendor firmware
 reading a Plugin partition written this way.
+
+## Update 2026-10-09: SPI flash speed and JFFS2 mount time
+
+The SPI flash controller now runs at 50 MHz (a 100 MHz parent and a divider; it
+was 25 MHz) and the SPI NAND is read with four data lines: `spi-rx-bus-width =
+<4>`, which selects the read from cache `6Bh`; commands, addresses and writes
+stay on one line. Reading 40 MiB takes 3.9 s, about 10 MB/s. The read-back was
+checked against the root file system of the running image and against the
+read-only partitions read at 25 MHz, and no ECC errors were reported. The CPU
+reads the controller FIFO, about 0.24 us per 32-bit word, which limits reads to
+roughly 16 MB/s whatever the clock. The vendor kernel uses DMA for this
+controller; mainline has no driver for that DMA controller, and the vendor
+device tree gives the controller no `dmas`.
+
+Mounting the 40 MiB Plugin partition took 16 s once its empty blocks carried a
+clean marker as long as a page, because the scan then read each empty block to
+its end. The scan now reads 1 KB after the marker and takes 0.24 s.
+
+Details: `target/linux/zte/docs/spi-nand-speed.md` and
+`target/linux/zte/docs/jffs2-on-spi-nand.md` in the ImmortalWrt tree.
