@@ -256,13 +256,16 @@
 };
 
 &spifc {
-	/* Keep SFC timing conservative until it is characterized on hardware. */
-	spi-max-frequency = <25000000>;
+	/*
+	 * 25 MHz was the bring-up value. 50 MHz is the first step up from it; the
+	 * reads have to be checked against the contents read at 25 MHz.
+	 */
+	spi-max-frequency = <50000000>;
 	status = "okay";
 
 	flash@0 {
 		partitions-only;
-		spi-max-frequency = <25000000>;
+		spi-max-frequency = <50000000>;
 
 		partitions {
 			partition@100000 {
