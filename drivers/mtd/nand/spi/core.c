@@ -1784,6 +1784,9 @@ static int spinand_init(struct spinand_device *spinand)
 	mtd->ecc_step_size = nanddev_get_ecc_conf(nand)->step_size;
 	mtd->bitflip_threshold = DIV_ROUND_UP(mtd->ecc_strength * 3, 4);
 
+	/* The on-die ECC is generated again at every program of a page. */
+	mtd->program_once = nand->ecc.engine == nand->ecc.ondie_engine;
+
 	ret = spinand_create_dirmaps(spinand);
 	if (ret) {
 		dev_err(dev,

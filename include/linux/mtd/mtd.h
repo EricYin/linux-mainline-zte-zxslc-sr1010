@@ -374,6 +374,12 @@ struct mtd_info {
 	struct mtd_ecc_stats ecc_stats;
 	/* Subpage shift (NAND) */
 	int subpage_sft;
+	/*
+	 * A page can be programmed only once between two erases: the ECC of the
+	 * whole page is generated at every program and merged with what the
+	 * page already holds, so a page written in pieces cannot be read back.
+	 */
+	bool program_once;
 
 	void *priv;
 
