@@ -224,4 +224,6 @@ int add_uevent_var(struct kobj_uevent_env *env, const char *format, ...);
 int broadcast_uevent(struct sk_buff *skb, __u32 pid, __u32 group,
 		     gfp_t allocation);
 
+u64 uevent_next_seqnum(void);
+
 #endif /* _KOBJECT_H_ */
