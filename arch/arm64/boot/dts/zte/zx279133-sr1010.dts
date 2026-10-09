@@ -162,8 +162,16 @@
 
 	lan_cpu: ethernet-lan-cpu {
 		compatible = "zte,zx279133-lan-conduit";
-		nvmem-cells = <&factory_lan_mac>;
-		nvmem-cell-names = "mac-address";
+		/*
+		 * No address of its own: the conduit, the switch ports and the
+		 * bridge keep the WAN address, as the factory firmware does
+		 * (br0, eth0..4 and nbif0 share one MAC there). The hardware writes
+		 * a single source MAC into routed frames, the CPU/WAN MAC of its
+		 * WANID table, and the flow offload refuses a WAN-to-LAN flow
+		 * whose source MAC is another one, so a separate LAN address left
+		 * every download on the software path. factory_lan_mac (tag 0x0101)
+		 * stays available below for a board that wants one.
+		 */
 	};
 
 	switch {
