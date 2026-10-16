@@ -479,6 +479,9 @@
 				 <&topcrm ZX279133_TOPCRM_CLK_PON_MAC_WCLK>;
 			clock-names = "idm-aclk", "tm-aclk", "pclk", "smac-wclk",
 				      "woe1-wclk", "mac-wclk";
+			/* Factory rate; at 125 MHz RED drops under bidirectional load. */
+			assigned-clocks = <&topcrm ZX279133_TOPCRM_CLK_PON_NPPT_WCLK_MUX>;
+			assigned-clock-rates = <416666666>;
 			pcs-handle = <&xpcs1>;
 			zte,lan-pcs-handle = <&xpcs0>;
 			phys = <&pon_serdes>, <&uni_serdes>;
