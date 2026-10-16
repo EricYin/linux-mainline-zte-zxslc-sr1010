@@ -332,6 +332,37 @@ static void zx279133_flow_slot_release(struct zx279133_flow_offload *offload,
 		offload->fast_full_zcam_used--;
 }
 
+/*
+ * As np.ko's fast_table_write(): a multi entry, whose response starts in the
+ * IKEY table, while the ZCAM and the 4096 IKEYs have room, else a full SDT14
+ * entry, which can overflow into the DDR bulk. The LAN entry program adds a
+ * PPPoE header from either.
+ */
+static int zx279133_flow_storage_alloc(struct zx279133_flow_offload *offload,
+				       struct zx279133_flow_entry *entry)
+{
+	int ret;
+
+	if (!entry->full) {
+		ret = zx279133_flow_slot_alloc(offload, entry,
+					       ZX279133_FAST_MULTI_SELECTOR);
+		if (!ret) {
+			ret = zx279133_fast_index_alloc(offload->ikey_used,
+							ZX279133_FAST_IKEY_DEPTH,
+							&entry->ikey);
+			if (!ret)
+				return 0;
+			zx279133_flow_slot_release(offload, entry);
+		}
+		if (ret != -ENOSPC)
+			return ret;
+		entry->full = true;
+	}
+
+	return zx279133_flow_slot_alloc(offload, entry,
+					ZX279133_FAST_FULL_SELECTOR);
+}
+
 static int zx279133_zcam_write(struct zx279133_flow_offload *offload,
 			       u8 zblock, u8 zcell, u8 zaddr,
 			       const u32 *table, unsigned int words)
@@ -1080,30 +1111,17 @@ static int zx279133_flow_replace(struct zx279133_flow_offload *offload,
 		}
 		pppoe = peer->pppoe;
 	}
-	/*
-	 * PPPoE pop stays out of the finite IKEY table in a full entry. The
-	 * push needs the IKEY of a multi entry, as np.ko builds it: the LAN
-	 * entry program adds the header only on that path.
-	 */
-	full = pppoe && !entry->upstream;
+	/* PPPoE pop stays out of the finite IKEY table in a full entry. */
 	entry->pppoe = pppoe;
-	entry->full = full;
+	entry->full = pppoe && !entry->upstream;
 	entry->has_age = true;
-	ret = zx279133_flow_slot_alloc(offload, entry,
-				       full ? ZX279133_FAST_FULL_SELECTOR :
-					      ZX279133_FAST_MULTI_SELECTOR);
+	ret = zx279133_flow_storage_alloc(offload, entry);
 	if (ret)
 		goto out_free;
-	if (!full) {
-		ret = zx279133_fast_index_alloc(offload->ikey_used,
-						ZX279133_FAST_IKEY_DEPTH,
-						&entry->ikey);
-		if (ret)
-			goto out_release_slot;
-	}
+	full = entry->full;
 	ret = zx279133_fast_age_alloc(offload, &entry->age);
 	if (ret)
-		goto out_release_ikey;
+		goto out_release_storage;
 	ret = zx279133_fast_index_alloc(offload->stat_used,
 					ZX279133_FAST_STAT_DEPTH, &entry->stat);
 	if (!ret) {
@@ -1194,10 +1212,9 @@ out_release_stat:
 		__clear_bit(entry->stat, offload->stat_used);
 out_release_age:
 	__clear_bit(entry->age, offload->age_used);
-out_release_ikey:
+out_release_storage:
 	if (!full)
 		__clear_bit(entry->ikey, offload->ikey_used);
-out_release_slot:
 	zx279133_flow_slot_release(offload, entry);
 out_free:
 	mutex_unlock(&offload->lock);
