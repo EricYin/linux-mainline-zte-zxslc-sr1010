@@ -466,11 +466,16 @@ static int zx279133_topcrm_clk_probe(struct platform_device *pdev)
 	pon_nppt_wclk_parents[5].hw = priv->parents[ZX279133_PARENT_CLK500M];
 	pon_nppt_wclk_parents[6].hw = priv->parents[ZX279133_PARENT_CLK416M];
 	pon_nppt_wclk_parents[7].hw = priv->parents[ZX279133_PARENT_CLK_PON_125M];
+	/*
+	 * Writable: the boot loader leaves the network processor on 125 MHz,
+	 * the factory kernel runs it from clk416m, and the device tree asks for
+	 * that rate.
+	 */
 	hw = zx279133_register_mux(dev, "pon_nppt_wclk_mux",
 				   pon_nppt_wclk_parents,
 				   ARRAY_SIZE(pon_nppt_wclk_parents),
 				   base + ZX279133_TOPCRM_PON_NPPT_WCLK_MUX_CTRL,
-				   24, 3, CLK_MUX_READ_ONLY, &priv->lock);
+				   24, 3, 0, &priv->lock);
 	if (IS_ERR(hw))
 		return dev_err_probe(dev, PTR_ERR(hw),
 				     "failed to register pon_nppt_wclk mux\n");
