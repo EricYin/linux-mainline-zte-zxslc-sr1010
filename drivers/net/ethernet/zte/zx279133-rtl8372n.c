@@ -4931,9 +4931,13 @@ static int zx279133_rtl8372n_port_fdb_add(struct dsa_switch *ds, int port,
 	struct zx279133_rtl8372n *priv = ds->priv;
 	int ret;
 
-	if (port == RTL8372N_CPU_PORT)
-		return 0;
-	if (port < RTL8372N_USER_PORT_MIN || port > RTL8372N_USER_PORT_MAX)
+	/*
+	 * Host addresses, such as the bridge's own, come for the CPU port.
+	 * The CPU port does not learn, so without a static entry a frame
+	 * for the router is unknown unicast and floods every bridged port.
+	 */
+	if (port != RTL8372N_CPU_PORT &&
+	    (port < RTL8372N_USER_PORT_MIN || port > RTL8372N_USER_PORT_MAX))
 		return -EINVAL;
 	if (!is_unicast_ether_addr(addr) || vid > 4095)
 		return -EINVAL;
@@ -4952,9 +4956,8 @@ static int zx279133_rtl8372n_port_fdb_del(struct dsa_switch *ds, int port,
 	struct zx279133_rtl8372n *priv = ds->priv;
 	int ret;
 
-	if (port == RTL8372N_CPU_PORT)
-		return 0;
-	if (port < RTL8372N_USER_PORT_MIN || port > RTL8372N_USER_PORT_MAX)
+	if (port != RTL8372N_CPU_PORT &&
+	    (port < RTL8372N_USER_PORT_MIN || port > RTL8372N_USER_PORT_MAX))
 		return -EINVAL;
 	if (!is_unicast_ether_addr(addr) || vid > 4095)
 		return -EINVAL;
