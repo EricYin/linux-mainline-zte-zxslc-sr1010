@@ -313,6 +313,30 @@ static void zx279133_idm_rx_put_vlan(struct sk_buff *skb, u16 vid)
 	__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), vid);
 }
 
+/*
+ * The source port the PPU reports in descriptor word 1. For a LAN frame the
+ * entry program (PC 10) reports the logical port, which is the frame's
+ * RTL8372N transport VID, and has removed the tag itself; 0 otherwise.
+ */
+static u16 zx279133_idm_rx_lan_vport(u32 word1)
+{
+	u16 port = (word1 >> 16) & 0x3f;
+
+	return port >= ZX279133_LAN_TRANSPORT_VID_MIN &&
+	       port <= ZX279133_LAN_TRANSPORT_VID_MAX ? port : 0;
+}
+
+/* Whether word 1 names the port of a frame the PPU parsed for this side. */
+static bool zx279133_idm_rx_parsed(u32 word1, bool lan_source)
+{
+	u16 port = (word1 >> 16) & 0x3f;
+
+	if (lan_source)
+		return port == ZX279133_LAN_TX_PORT ||
+		       zx279133_idm_rx_lan_vport(word1);
+	return port == zx279133_tx_port;
+}
+
 static u16 zx279133_idm_rx_restore_lan_l2(struct sk_buff *skb, u32 metadata0)
 {
 	u16 l3_prefix = metadata0 >> 16;
@@ -527,7 +551,12 @@ static int zx279133_idm_rx_process_queue(struct zx279133_eth *eth,
 			zx279133_stats_rx_length_error(eth, ndev);
 			goto reuse_buffer;
 		}
-		lan_source = queue < ZX279133_LAN_RX_QUEUE_COUNT;
+		/*
+		 * A LAN port switched to WAN-type hands its frames for the CPU
+		 * to the WAN queues, whole, with its transport VID in word 1.
+		 */
+		lan_source = queue < ZX279133_LAN_RX_QUEUE_COUNT ||
+			     zx279133_idm_rx_lan_vport(word1);
 
 		if (buffer.xsk) {
 			struct xdp_buff *replacement_xsk;
@@ -744,7 +773,7 @@ deliver_skb:
 			 * parsed descriptor fields, that split remains stable when CPU8
 			 * strips the LAN transport VLAN before PPU.
 			 */
-			if (lan_source)
+			if (queue < ZX279133_LAN_RX_QUEUE_COUNT)
 				len += zx279133_idm_rx_restore_lan_l2(
 					skb, le32_to_cpu(READ_ONCE(desc->metadata[0])));
 			if (lan_source && !lan_dsa_active) {
@@ -755,8 +784,12 @@ deliver_skb:
 			}
 
 			if (lan_dsa_active && lan_source && eth->lan_ndev) {
+				u16 transport_vid = zx279133_idm_rx_lan_vport(word1);
 				bool dsa_header = false;
-				u16 transport_vid = ZX279133_LAN_VID;
+
+				/* The tag is gone: the port comes from word 1. */
+				if (!transport_vid)
+					transport_vid = ZX279133_LAN_VID;
 
 				rx_ndev = eth->lan_ndev;
 				if (len >= ETH_HLEN &&
@@ -774,8 +807,7 @@ deliver_skb:
 					zx279133_idm_rx_put_vlan(skb, transport_vid);
 			}
 			if (!xdp_ran && (rx_ndev->features & NETIF_F_RXCSUM) &&
-			    ((word1 >> 16) & 0x3f) ==
-			    (lan_source ? ZX279133_LAN_TX_PORT : zx279133_tx_port) &&
+			    zx279133_idm_rx_parsed(word1, lan_source) &&
 			    zx279133_idm_rx_l4_valid(skb)) {
 				skb->ip_summed = CHECKSUM_UNNECESSARY;
 				u64_stats_inc(&stats->rx_hw_csum_packets);

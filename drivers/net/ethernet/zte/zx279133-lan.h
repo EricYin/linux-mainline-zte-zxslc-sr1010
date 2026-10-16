@@ -65,6 +65,8 @@ struct zx279133_lan_service_ops {
 	int (*netdev_setup_tc)(struct zx279133_lan_service *service,
 			       struct net_device *ndev,
 			       enum tc_setup_type type, void *type_data);
+	int (*port_wan_set)(struct zx279133_lan_service *service, u16 vid,
+			    bool wan);
 };
 
 struct zx279133_lan_service {
@@ -112,6 +114,15 @@ static inline void
 zx279133_lan_service_xmac_unlock(struct zx279133_lan_service *service)
 {
 	service->ops->xmac_unlock(service);
+}
+
+/* Make the LAN port with this transport VID WAN-type or LAN-type. */
+static inline int
+zx279133_lan_service_port_wan_set(struct zx279133_lan_service *service,
+				  u16 vid, bool wan)
+{
+	return service->ops->port_wan_set ?
+	       service->ops->port_wan_set(service, vid, wan) : 0;
 }
 
 static inline int

@@ -220,6 +220,47 @@ out_unlock:
 	return ret;
 }
 
+static void zx279133_xmac_close(struct zx279133_eth *eth, u32 base, u32 ctrl)
+{
+	void __iomem *reg = eth->base + base + ctrl;
+
+	writel(readl(reg) & ~ZX279133_XMAC_ENABLE, reg);
+}
+
+/*
+ * Leave the NPPT quiet for whatever runs next. Nothing else stops it on
+ * reboot or kexec: the LAN switch keeps its share of the datapath until it
+ * is removed, so frames still arriving would be written by DMA into memory
+ * that a kexec'ed kernel already uses. Close both MACs so that nothing more
+ * comes in, then stop the interrupts and the IDM descriptor fetches, and
+ * leave the rest as it is: undoing the whole setup here with
+ * zx279133_hardware_unprepare() was followed by a reset of the board about
+ * a second later, every time.
+ */
+void zx279133_shutdown(struct zx279133_eth *eth)
+{
+	mutex_lock(&eth->datapath_lock);
+	if (eth->hardware_prepared) {
+		mutex_lock(&eth->xmac_lock);
+		zx279133_xmac_close(eth, ZX279133_XMAC0_BASE,
+				    ZX279133_XMAC_RX_CTRL);
+		zx279133_xmac_close(eth, ZX279133_XMAC1_BASE,
+				    ZX279133_XMAC_RX_CTRL);
+		mutex_unlock(&eth->xmac_lock);
+		zx279133_shared_rx_stop(eth);
+		zx279133_shared_tx_pause(eth);
+		mutex_lock(&eth->xmac_lock);
+		zx279133_xmac_close(eth, ZX279133_XMAC0_BASE,
+				    ZX279133_XMAC_TX_CTRL);
+		zx279133_xmac_close(eth, ZX279133_XMAC1_BASE,
+				    ZX279133_XMAC_TX_CTRL);
+		mutex_unlock(&eth->xmac_lock);
+		zx279133_route_set(eth, false);
+		zx279133_idm_tx_deactivate(eth);
+	}
+	mutex_unlock(&eth->datapath_lock);
+}
+
 static int zx279133_stop(struct net_device *ndev)
 {
 	struct zx279133_eth *eth = netdev_priv(ndev);
@@ -1562,9 +1603,30 @@ const struct ethtool_ops zx279133_ethtool_ops = {
 /*
  * RX admission is owned by the fixed NPPT/PPU port-flow image, not an XMAC
  * address filter. It delivers broadcast, foreign unicast, and arbitrary
- * multicast frames to IDM, so there is no hardware filter for ndo_set_rx_mode
- * to update and IFF_UNICAST_FLT must remain clear.
+ * multicast frames to IDM, so IFF_UNICAST_FLT must remain clear. The unicast
+ * list still matters to the flow offload: only frames sent to an ONU MAC slot
+ * are forwarded in hardware, so ndo_set_rx_mode copies the list there. It
+ * runs under the address list spinlock, so the slots are written from a work
+ * item that can take datapath_lock.
  */
+void zx279133_rx_mode_work(struct work_struct *work)
+{
+	struct zx279133_eth *eth = container_of(work, struct zx279133_eth,
+						rx_mode_work);
+
+	mutex_lock(&eth->datapath_lock);
+	if (eth->hardware_prepared)
+		zx279133_program_spa_uc_macs(eth);
+	mutex_unlock(&eth->datapath_lock);
+}
+
+static void zx279133_set_rx_mode(struct net_device *ndev)
+{
+	struct zx279133_eth *eth = netdev_priv(ndev);
+
+	schedule_work(&eth->rx_mode_work);
+}
+
 static int zx279133_setup_tc(struct net_device *ndev,
 			    enum tc_setup_type type, void *type_data)
 {
@@ -1586,6 +1648,7 @@ const struct net_device_ops zx279133_netdev_ops = {
 	.ndo_start_xmit		= zx279133_start_xmit,
 	.ndo_tx_timeout		= zx279133_tx_timeout,
 	.ndo_set_mac_address	= zx279133_set_mac_address,
+	.ndo_set_rx_mode	= zx279133_set_rx_mode,
 	.ndo_validate_addr	= eth_validate_addr,
 	.ndo_change_mtu		= zx279133_change_mtu,
 	.ndo_get_stats64	= zx279133_get_stats64,
@@ -1929,6 +1992,13 @@ static int zx279133_lan_get_rxfh_fields(struct zx279133_lan_service *service,
 					      fields);
 }
 
+static int zx279133_lan_port_wan_set(struct zx279133_lan_service *service,
+				     u16 vid, bool wan)
+{
+	return zx279133_lan_vport_wan_set(zx279133_lan_service_to_eth(service),
+					  vid, wan);
+}
+
 const struct zx279133_lan_service_ops zx279133_lan_service_ops = {
 	.get_rxfh = zx279133_lan_get_rxfh,
 	.set_rxfh = zx279133_lan_set_rxfh,
@@ -1951,4 +2021,5 @@ const struct zx279133_lan_service_ops zx279133_lan_service_ops = {
 	.netdev_get_stats64 = zx279133_lan_netdev_get_stats64,
 	.netdev_change_mtu = zx279133_lan_netdev_change_mtu,
 	.netdev_setup_tc = zx279133_lan_netdev_setup_tc,
+	.port_wan_set = zx279133_lan_port_wan_set,
 };

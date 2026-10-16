@@ -225,6 +225,13 @@ void zx279133_hardware_unprepare(struct zx279133_eth *eth)
 	eth->hardware_prepared = false;
 }
 
+static void zx279133_rx_mode_work_cancel(void *data)
+{
+	struct zx279133_eth *eth = data;
+
+	cancel_work_sync(&eth->rx_mode_work);
+}
+
 static int zx279133_eth_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -273,6 +280,7 @@ static int zx279133_eth_probe(struct platform_device *pdev)
 			  zx279133_idm_tx_reclaim_work);
 	INIT_DELAYED_WORK(&eth->rx_refill_work,
 			  zx279133_idm_rx_refill_work);
+	INIT_WORK(&eth->rx_mode_work, zx279133_rx_mode_work);
 	mutex_init(&eth->xmac_lock);
 	mutex_init(&eth->datapath_lock);
 	mutex_init(&eth->np_ind_lock);
@@ -501,6 +509,9 @@ static int zx279133_eth_probe(struct platform_device *pdev)
 	ret = zx279133_flow_offload_init(eth);
 	if (ret)
 		return ret;
+	ret = zx279133_wanid_debugfs_init(eth);
+	if (ret)
+		return ret;
 	ret = zx279133_ptp_init(eth);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to register PHC\n");
@@ -644,6 +655,10 @@ static int zx279133_eth_probe(struct platform_device *pdev)
 
 	eth->rx_rss_map[0] = 0xf0;
 	eth->rx_rss_map[1] = 0xf0;
+	/* Runs after the netdev is unregistered, when nothing queues it. */
+	ret = devm_add_action_or_reset(dev, zx279133_rx_mode_work_cancel, eth);
+	if (ret)
+		return ret;
 	ret = devm_register_netdev(dev, ndev);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to register netdev\n");
@@ -661,6 +676,14 @@ static int zx279133_eth_probe(struct platform_device *pdev)
 	return 0;
 }
 
+static void zx279133_eth_shutdown(struct platform_device *pdev)
+{
+	struct zx279133_lan_service *service = platform_get_drvdata(pdev);
+
+	zx279133_shutdown(container_of(service, struct zx279133_eth,
+				       lan_service));
+}
+
 static const struct of_device_id zx279133_eth_of_match[] = {
 	{ .compatible = "zte,zx279133-nppt" },
 	{ }
@@ -669,6 +692,7 @@ MODULE_DEVICE_TABLE(of, zx279133_eth_of_match);
 
 static struct platform_driver zx279133_eth_driver = {
 	.probe = zx279133_eth_probe,
+	.shutdown = zx279133_eth_shutdown,
 	.driver = {
 		.name = "zx279133-eth",
 		.of_match_table = zx279133_eth_of_match,

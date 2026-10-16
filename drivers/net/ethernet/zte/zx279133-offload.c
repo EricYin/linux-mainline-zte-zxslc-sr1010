@@ -2,12 +2,14 @@
 /* ZTE ZX279133 NPPT IPv4/IPv6 flow-table offload. */
 
 #include <linux/bitmap.h>
+#include <linux/debugfs.h>
 #include <linux/etherdevice.h>
 #include <linux/iopoll.h>
 #include <linux/ip.h>
 #include <linux/ipv6.h>
 #include <linux/jiffies.h>
 #include <linux/rhashtable.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
@@ -48,10 +50,10 @@
 #define ZX279133_FAST_MULTI_FOOTER	0xc1
 #define ZX279133_FAST_FULL_SELECTOR	0x00
 #define ZX279133_FAST_FULL_FOOTER	0xe0
-#define ZX279133_PPPOE_PUSH_WANID	0
-#define ZX279133_PPPOE_POP_WANID	16
-#define ZX279133_PPPOE_PUSH		1
-#define ZX279133_PPPOE_POP		2
+
+/* SDT 9 host entries: CRC selector and the valid/type bits of word 3. */
+#define ZX279133_HOST_SELECTOR		0x00
+#define ZX279133_HOST_FLAGS		0xa0000000
 
 enum zx279133_flow_port {
 	ZX279133_FLOW_PORT_NONE,
@@ -73,9 +75,29 @@ struct zx279133_flow_data {
 	struct in6_addr dst_v6;
 };
 
+/*
+ * The LAN entry program (PC 10) first looks the source MAC of every frame up
+ * in the SDT 9 MAC table, and takes only a hit on to the flow table; a miss
+ * goes to the CPU. np.ko keeps that table in step with the bridge. Here a LAN
+ * host gets an entry while it has an offloaded downstream flow: the flow's
+ * destination MAC is the host, and its egress VID is the host's logical port.
+ */
+struct zx279133_flow_host {
+	struct list_head node;
+	u8 mac[ETH_ALEN];
+	u16 port;
+	u8 zblock;
+	u8 zcell;
+	u8 zaddr;
+	unsigned int users;
+};
+
 struct zx279133_flow_entry {
 	struct rhash_head key_node;
 	u8 key[ZX279133_FAST_KEY_SIZE];
+	/* An upstream entry is indexed by the key its reply will have. */
+	struct rhash_head reply_node;
+	u8 reply_key[ZX279133_FAST_KEY_SIZE];
 	u8 zblock;
 	u8 zcell;
 	u8 zaddr;
@@ -83,6 +105,10 @@ struct zx279133_flow_entry {
 	u32 age;
 	u16 ikey;
 	u16 stat;
+	u8 wanid;
+	struct zx279133_flow_host *host;
+	/* The flowtable the entry came from. */
+	const struct flow_block *fblock;
 	u64 packets;
 	u64 bytes;
 	unsigned long lastused;
@@ -90,6 +116,16 @@ struct zx279133_flow_entry {
 	bool has_age;
 	bool snat;
 	bool pppoe;
+	/* From a LAN port, out by the WAN path; else from the WAN port. */
+	bool upstream;
+	/* Out of a LAN port, a second WAN, rather than the WAN port. */
+	bool lan_routed;
+	/*
+	 * Kept out of the hardware, holding nothing there: only remembers,
+	 * by its reply key, that the other half of the flow comes in PPPoE.
+	 */
+	bool refused;
+	bool reply_indexed;
 	bool full;
 	bool in_ddr;
 };
@@ -100,21 +136,16 @@ struct zx279133_flow_offload {
 	struct mutex lock;
 	struct xarray flows;
 	struct rhashtable key_flows;
+	struct rhashtable reply_flows;
 	struct list_head block_cb_list;
+	struct list_head hosts;
 	DECLARE_BITMAP(zcam_used, ZX279133_ZCAM_SLOTS);
 	unsigned long *ddr_used;
 	DECLARE_BITMAP(ikey_used, ZX279133_FAST_IKEY_DEPTH);
 	DECLARE_BITMAP(age_used, ZX279133_FAST_AGE_DEPTH);
 	DECLARE_BITMAP(stat_used, ZX279133_FAST_STAT_DEPTH);
-	__be32 snat_addr;
-	u32 snat_users;
-	u32 saved_wanid_sip;
-	u16 pppoe_sid;
-	u16 saved_pppoe_sid[2];
-	u32 pppoe_users;
 	u32 ddr_entries;
 	u16 fast_full_zcam_used;
-	u8 saved_pppoe_mode[2];
 };
 
 static const struct rhashtable_params zx279133_flow_key_ht_params = {
@@ -124,9 +155,18 @@ static const struct rhashtable_params zx279133_flow_key_ht_params = {
 	.automatic_shrinking = true,
 };
 
+static const struct rhashtable_params zx279133_flow_reply_ht_params = {
+	.head_offset = offsetof(struct zx279133_flow_entry, reply_node),
+	.key_offset = offsetof(struct zx279133_flow_entry, reply_key),
+	.key_len = ZX279133_FAST_KEY_SIZE,
+	.automatic_shrinking = true,
+};
+
 struct zx279133_flow_block {
 	struct zx279133_flow_offload *offload;
 	struct net_device *ndev;
+	/* The flowtable's block; it is shared by all its devices. */
+	struct flow_block *fblock;
 };
 
 static unsigned int zx279133_zcam_slot(u8 zblock, u8 zcell, u8 zaddr)
@@ -324,6 +364,92 @@ out_restore_clock:
 	return ret;
 }
 
+static void zx279133_host_entry_build(u32 *w, const u8 *mac, u16 port)
+{
+	/* Response: logical port in bits 33:28; VID and rate-limit slot 0. */
+	w[0] = (port & 0xf) << 28;
+	/* Key: the MAC least-significant byte first, then VID 0. */
+	w[1] = (port >> 4 & 0x3) | (u32)mac[5] << 24;
+	w[2] = mac[4] | mac[3] << 8 | mac[2] << 16 | (u32)mac[1] << 24;
+	w[3] = mac[0] | ZX279133_HOST_FLAGS;
+}
+
+static struct zx279133_flow_host *
+zx279133_host_get(struct zx279133_flow_offload *offload, const u8 *mac,
+		  u16 port)
+{
+	struct zx279133_flow_host *host;
+	u8 key[ZX279133_FAST_KEY_SIZE] = {};
+	u32 w[4];
+	int i;
+
+	list_for_each_entry(host, &offload->hosts, node) {
+		if (!ether_addr_equal(host->mac, mac))
+			continue;
+		/* The host has moved to another LAN port. */
+		if (host->port != port) {
+			zx279133_host_entry_build(w, mac, port);
+			if (zx279133_zcam_write(offload, host->zblock,
+						host->zcell, host->zaddr, w,
+						ARRAY_SIZE(w)))
+				return NULL;
+			host->port = port;
+		}
+		host->users++;
+		return host;
+	}
+
+	host = kzalloc(sizeof(*host), GFP_KERNEL);
+	if (!host)
+		return NULL;
+	/* The hash input is the selector, then the key: MAC LSB first, VID. */
+	for (i = 0; i < ETH_ALEN; i++)
+		key[i] = mac[ETH_ALEN - 1 - i];
+	if (zx279133_zcam_alloc(offload, key, ZX279133_HOST_SELECTOR,
+				&host->zblock, &host->zcell, &host->zaddr))
+		goto err_free;
+	zx279133_host_entry_build(w, mac, port);
+	if (zx279133_zcam_write(offload, host->zblock, host->zcell,
+				host->zaddr, w, ARRAY_SIZE(w)))
+		goto err_release;
+	ether_addr_copy(host->mac, mac);
+	host->port = port;
+	host->users = 1;
+	list_add(&host->node, &offload->hosts);
+	return host;
+
+err_release:
+	clear_bit(zx279133_zcam_slot(host->zblock, host->zcell, host->zaddr),
+		  offload->zcam_used);
+err_free:
+	kfree(host);
+	return NULL;
+}
+
+static void zx279133_host_free(struct zx279133_flow_offload *offload,
+			       struct zx279133_flow_host *host,
+			       bool clear_hardware)
+{
+	u32 w[4] = {};
+
+	if (clear_hardware &&
+	    zx279133_zcam_write(offload, host->zblock, host->zcell,
+				host->zaddr, w, ARRAY_SIZE(w)))
+		dev_warn(offload->eth->dev, "failed to clear host %pM\n",
+			 host->mac);
+	clear_bit(zx279133_zcam_slot(host->zblock, host->zcell, host->zaddr),
+		  offload->zcam_used);
+	list_del(&host->node);
+	kfree(host);
+}
+
+static void zx279133_host_put(struct zx279133_flow_offload *offload,
+			      struct zx279133_flow_host *host)
+{
+	if (host && !--host->users)
+		zx279133_host_free(offload, host, true);
+}
+
 static void zx279133_ddr_write(struct zx279133_flow_offload *offload,
 			       u32 bucket, const u32 *table)
 {
@@ -426,12 +552,37 @@ static void zx279133_fast_key_build_v6(u8 *key,
 	key[15] = ip_proto;
 }
 
+/*
+ * The key the reply of an upstream flow is looked up with: the translated
+ * tuple with source and destination exchanged.
+ */
+static void zx279133_fast_reply_key_build(u8 *key,
+					  const struct zx279133_flow_data *data,
+					  const struct zx279133_flow_tuple *xlate,
+					  u8 ip_proto, bool ipv6)
+{
+	struct zx279133_flow_data reply = {};
+
+	reply.tuple.src_addr = xlate->dst_addr;
+	reply.tuple.dst_addr = xlate->src_addr;
+	reply.tuple.src_port = xlate->dst_port;
+	reply.tuple.dst_port = xlate->src_port;
+	if (ipv6) {
+		reply.src_v6 = data->dst_v6;
+		reply.dst_v6 = data->src_v6;
+		zx279133_fast_key_build_v6(key, &reply, ip_proto);
+	} else {
+		zx279133_fast_key_build(key, &reply.tuple, ip_proto);
+	}
+}
+
 static void zx279133_fast_response_build(u8 *fast,
 					 const struct zx279133_flow_data *data,
 					 const struct zx279133_flow_tuple *xlate,
 					 enum zx279133_flow_port ingress,
-					 u16 lan_vid, u16 ikey, u16 stat,
-					 bool has_stat, bool pppoe)
+					 enum zx279133_flow_port egress,
+					 u16 gemport, u16 ikey, u16 stat,
+					 bool has_stat, bool pppoe, u8 wanid)
 {
 	int i;
 
@@ -445,20 +596,26 @@ static void zx279133_fast_response_build(u8 *fast,
 	for (i = 0; i < ETH_ALEN; i++)
 		fast[8 + i] = data->eth.h_dest[ETH_ALEN - 1 - i];
 
-	put_unaligned(ingress == ZX279133_FLOW_PORT_LAN ? zx279133_tx_port :
-		      lan_vid, (u16 *)(fast + 20));
-	fast[23] = ingress == ZX279133_FLOW_PORT_WAN ? 16 : 0;
+	put_unaligned(gemport, (u16 *)(fast + 20));
+	/* Bits 4:0 select the WANID entry that supplies the source MAC. */
+	fast[23] = wanid;
 	put_unaligned(ikey, (u16 *)(fast + 26));
 	if (has_stat)
 		fast[29] |= BIT(4);
 	fast[30] = BIT(5) | BIT(4) | BIT(3);
 	if (ingress == ZX279133_FLOW_PORT_LAN) {
-		/* The factory RTL8372N CPU link carries a four-byte private
-		 * service tag. Pop it before routing to the WAN; with PPPoE push,
-		 * the net packet-length change remains four bytes.
+		/*
+		 * The LAN entry program has already removed the RTL8372N
+		 * transport tag, so the frame keeps its VLAN action and only a
+		 * PPPoE push changes its length (eight bytes, stored halved).
+		 * wan_mode (bit 1) sends it out the WAN path, where the push
+		 * takes the session from the WANID entry and the frame leaves
+		 * by the port at byte 20, a LAN port too. Without it the egress
+		 * port is cleared and the frame is lost, whichever port it is
+		 * for.
 		 */
-		put_unaligned(2, (u32 *)(fast + 16));
-		fast[30] |= BIT(7);
+		put_unaligned(pppoe ? 4 : 0, (u32 *)(fast + 16));
+		fast[29] |= BIT(1);
 	}
 
 	if (xlate->src_addr != data->tuple.src_addr)
@@ -467,11 +624,18 @@ static void zx279133_fast_response_build(u8 *fast,
 		zx279133_put_ipv4(fast + 4, xlate->dst_addr);
 		fast[30] |= BIT(0);
 	}
-	if (ingress == ZX279133_FLOW_PORT_LAN) {
+	/*
+	 * The port on the WAN side is always written, as np.ko does. Between
+	 * two LAN ports either side may be translated, when one of them is a
+	 * second WAN.
+	 */
+	if (ingress == ZX279133_FLOW_PORT_LAN ||
+	    xlate->src_port != data->tuple.src_port) {
 		put_unaligned(ntohs(xlate->src_port), (u16 *)fast);
 		fast[30] |= BIT(1);
 	}
-	if (ingress == ZX279133_FLOW_PORT_WAN) {
+	if (ingress == ZX279133_FLOW_PORT_WAN ||
+	    xlate->dst_port != data->tuple.dst_port) {
 		put_unaligned(ntohs(xlate->dst_port), (u16 *)(fast + 14));
 		fast[30] |= BIT(2);
 	}
@@ -591,19 +755,6 @@ static int zx279133_flow_mangle_ipv4(const struct flow_action_entry *act,
 	return 0;
 }
 
-static enum zx279133_flow_port
-zx279133_flow_dev_port(struct zx279133_eth *eth, const struct net_device *dev)
-{
-	if (!dev)
-		return ZX279133_FLOW_PORT_NONE;
-	if (dev == eth->ndev)
-		return ZX279133_FLOW_PORT_WAN;
-	if (eth->lan_ndev &&
-	    (dev == eth->lan_ndev || dev_get_iflink(dev) == eth->lan_ndev->ifindex))
-		return ZX279133_FLOW_PORT_LAN;
-	return ZX279133_FLOW_PORT_NONE;
-}
-
 static int zx279133_flow_lan_vid(struct zx279133_eth *eth,
 				 struct net_device *dev, u16 *vid)
 {
@@ -622,95 +773,34 @@ static int zx279133_flow_lan_vid(struct zx279133_eth *eth,
 #endif
 }
 
-static int zx279133_flow_snat_get(struct zx279133_flow_offload *offload,
-				  __be32 addr)
+/*
+ * Where a device is in the data path, and the port its frames leave by: the
+ * WAN port, or the transport VID of a LAN port. A LAN port switched to
+ * WAN-type, a second WAN, counts as WAN; 0 when a LAN device is not one port.
+ */
+static enum zx279133_flow_port
+zx279133_flow_dev_port(struct zx279133_eth *eth, struct net_device *dev,
+		       u16 *gemport)
 {
-	int ret;
+	unsigned long wan_vports = READ_ONCE(eth->lan_wan_vports);
+	u16 vid = 0;
 
-	if (offload->snat_users) {
-		if (offload->snat_addr != addr)
-			return -EOPNOTSUPP;
-		offload->snat_users++;
-		return 0;
+	if (!dev)
+		return ZX279133_FLOW_PORT_NONE;
+	if (dev == eth->ndev) {
+		*gemport = zx279133_tx_port;
+		return ZX279133_FLOW_PORT_WAN;
 	}
-
-	ret = zx279133_program_wanid_sip(offload->eth, 0,
-					 be32_to_cpu(addr),
-					 &offload->saved_wanid_sip);
-	if (ret)
-		return ret;
-	offload->snat_addr = addr;
-	offload->snat_users = 1;
-	return 0;
-}
-
-static void zx279133_flow_snat_put(struct zx279133_flow_offload *offload)
-{
-	if (--offload->snat_users)
-		return;
-	if (zx279133_program_wanid_sip(offload->eth, 0,
-				       offload->saved_wanid_sip, NULL))
-		dev_warn(offload->eth->dev, "failed to restore WANID source IP\n");
-	offload->snat_addr = 0;
-}
-
-static int zx279133_flow_pppoe_get(struct zx279133_flow_offload *offload,
-				   u16 sid)
-{
-	int ret;
-
-	if (offload->pppoe_users) {
-		if (offload->pppoe_sid != sid)
-			return -EOPNOTSUPP;
-		offload->pppoe_users++;
-		return 0;
-	}
-
-	ret = zx279133_program_wanid_pppoe(offload->eth,
-					   ZX279133_PPPOE_PUSH_WANID,
-					   ZX279133_PPPOE_PUSH, sid,
-					   &offload->saved_pppoe_mode[0],
-					   &offload->saved_pppoe_sid[0]);
-	if (ret)
-		return ret;
-	ret = zx279133_program_wanid_pppoe(offload->eth,
-					   ZX279133_PPPOE_POP_WANID,
-					   ZX279133_PPPOE_POP, 0,
-					   &offload->saved_pppoe_mode[1],
-					   &offload->saved_pppoe_sid[1]);
-	if (ret) {
-		zx279133_program_wanid_pppoe(offload->eth,
-					     ZX279133_PPPOE_PUSH_WANID,
-					     offload->saved_pppoe_mode[0],
-					     offload->saved_pppoe_sid[0],
-					     NULL, NULL);
-		return ret;
-	}
-	offload->pppoe_sid = sid;
-	offload->pppoe_users = 1;
-
-	return 0;
-}
-
-static void zx279133_flow_pppoe_put(struct zx279133_flow_offload *offload)
-{
-	int ret;
-
-	if (--offload->pppoe_users)
-		return;
-	ret = zx279133_program_wanid_pppoe(offload->eth,
-					   ZX279133_PPPOE_POP_WANID,
-					   offload->saved_pppoe_mode[1],
-					   offload->saved_pppoe_sid[1],
-					   NULL, NULL);
-	ret |= zx279133_program_wanid_pppoe(offload->eth,
-					    ZX279133_PPPOE_PUSH_WANID,
-					    offload->saved_pppoe_mode[0],
-					    offload->saved_pppoe_sid[0],
-					    NULL, NULL);
-	if (ret)
-		dev_warn(offload->eth->dev, "failed to restore WANID PPPoE state\n");
-	offload->pppoe_sid = 0;
+	if (!eth->lan_ndev ||
+	    (dev != eth->lan_ndev &&
+	     dev_get_iflink(dev) != eth->lan_ndev->ifindex))
+		return ZX279133_FLOW_PORT_NONE;
+	if (zx279133_flow_lan_vid(eth, dev, &vid))
+		vid = 0;
+	*gemport = vid;
+	if (vid && wan_vports & BIT(vid - ZX279133_LAN_TRANSPORT_VID_MIN))
+		return ZX279133_FLOW_PORT_WAN;
+	return ZX279133_FLOW_PORT_LAN;
 }
 
 static int
@@ -718,7 +808,8 @@ zx279133_flow_parse(struct zx279133_flow_offload *offload,
 		    struct net_device *bind_dev, struct flow_cls_offload *f,
 		    struct zx279133_flow_data *data,
 		    struct zx279133_flow_tuple *xlate,
-		    enum zx279133_flow_port *ingress, u16 *lan_vid,
+		    enum zx279133_flow_port *ingress,
+		    enum zx279133_flow_port *egress, u16 *gemport,
 		    u8 *ip_proto, u16 *pppoe_sid, bool *ipv6)
 {
 	struct flow_rule *rule = flow_cls_offload_flow_rule(f);
@@ -730,8 +821,8 @@ zx279133_flow_parse(struct zx279133_flow_offload *offload,
 	struct flow_match_meta meta;
 	struct flow_action_entry *act;
 	struct net_device *idev;
-	enum zx279133_flow_port egress;
 	struct net_device *odev = NULL;
+	u16 igemport;
 	int i, ret;
 
 	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CONTROL) ||
@@ -747,10 +838,12 @@ zx279133_flow_parse(struct zx279133_flow_offload *offload,
 		rcu_read_lock();
 		idev = dev_get_by_index_rcu(dev_net(bind_dev),
 					    meta.key->ingress_ifindex);
-		*ingress = zx279133_flow_dev_port(offload->eth, idev);
+		*ingress = zx279133_flow_dev_port(offload->eth, idev,
+						  &igemport);
 		rcu_read_unlock();
 	} else {
-		*ingress = zx279133_flow_dev_port(offload->eth, idev);
+		*ingress = zx279133_flow_dev_port(offload->eth, idev,
+						  &igemport);
 	}
 	if (*ingress == ZX279133_FLOW_PORT_NONE)
 		return -EOPNOTSUPP;
@@ -829,33 +922,16 @@ zx279133_flow_parse(struct zx279133_flow_offload *offload,
 	    !is_valid_ether_addr(data->eth.h_dest))
 		return -EOPNOTSUPP;
 	/*
-	 * A flow entry holds the destination MAC only. The hardware takes the
-	 * source MAC of every routed frame from the WANID table, and that is the
-	 * WAN MAC in both directions, so a flow that needs another source MAC
-	 * would leave with the wrong one. Refuse it and say why, because the
-	 * packets then silently take the software path.
+	 * Besides LAN <-> WAN, a flow may be routed between two LAN ports,
+	 * as when one of them serves as a second WAN.
 	 */
-	if (!ether_addr_equal(data->eth.h_source, offload->eth->ndev->dev_addr)) {
-		dev_warn_once(offload->eth->dev,
-			      "flow offload refused: source MAC %pM is not the WAN MAC %pM, and the hardware sends only the WAN MAC; give the LAN the WAN address\n",
-			      data->eth.h_source, offload->eth->ndev->dev_addr);
-		return -EOPNOTSUPP;
-	}
-	egress = zx279133_flow_dev_port(offload->eth, odev);
-	if ((*ingress == ZX279133_FLOW_PORT_LAN &&
-	     egress != ZX279133_FLOW_PORT_WAN) ||
+	*egress = zx279133_flow_dev_port(offload->eth, odev, gemport);
+	if (*egress == ZX279133_FLOW_PORT_NONE || !*gemport ||
 	    (*ingress == ZX279133_FLOW_PORT_WAN &&
-	     egress != ZX279133_FLOW_PORT_LAN))
+	     *egress == ZX279133_FLOW_PORT_WAN))
 		return -EOPNOTSUPP;
 	if (*pppoe_sid && *ingress != ZX279133_FLOW_PORT_LAN)
 		return -EOPNOTSUPP;
-	if (*ingress == ZX279133_FLOW_PORT_WAN) {
-		ret = zx279133_flow_lan_vid(offload->eth, odev, lan_vid);
-		if (ret)
-			return ret;
-	} else {
-		*lan_vid = 0;
-	}
 
 	flow_action_for_each(i, act, &rule->action) {
 		if (act->id != FLOW_ACTION_MANGLE)
@@ -890,25 +966,27 @@ static bool zx279133_flow_key_exists(struct zx279133_flow_offload *offload,
 }
 
 static int zx279133_flow_replace(struct zx279133_flow_offload *offload,
-				 struct net_device *bind_dev,
+				 struct zx279133_flow_block *block,
 				 struct flow_cls_offload *f)
 {
+	struct net_device *bind_dev = block->ndev;
+	struct zx279133_wanid_profile profile = {};
 	struct zx279133_flow_tuple xlate;
 	struct zx279133_flow_data data = {};
-	struct zx279133_flow_entry *entry;
-	enum zx279133_flow_port ingress;
+	struct zx279133_flow_entry *entry, *peer;
+	enum zx279133_flow_port ingress, egress;
 	u8 fast[ZX279133_FAST_DATA_SIZE];
 	u32 ikey[ZX279133_FAST_IKEY_SIZE / sizeof(u32)];
 	u32 table[ZX279133_ZCAM_ENTRY_SIZE / sizeof(u32)];
-	bool ipv6, pppoe, full, snat, stat_capable;
+	bool ipv6, pppoe, full, snat;
 	unsigned int table_words;
-	u16 lan_vid, pppoe_sid = 0;
+	u16 gemport, pppoe_sid = 0;
 	u8 ip_proto;
 	int ret;
 
 	ret = zx279133_flow_parse(offload, bind_dev, f, &data, &xlate,
-				  &ingress, &lan_vid, &ip_proto, &pppoe_sid,
-				  &ipv6);
+				  &ingress, &egress, &gemport, &ip_proto,
+				  &pppoe_sid, &ipv6);
 	if (ret)
 		return ret;
 
@@ -921,6 +999,13 @@ static int zx279133_flow_replace(struct zx279133_flow_offload *offload,
 		zx279133_fast_key_build(entry->key, &data.tuple, ip_proto);
 	snat = !ipv6 && xlate.src_addr != data.tuple.src_addr;
 	entry->snat = snat;
+	entry->fblock = block->fblock;
+	entry->upstream = ingress == ZX279133_FLOW_PORT_LAN;
+	entry->lan_routed = ingress == ZX279133_FLOW_PORT_LAN &&
+			    egress == ZX279133_FLOW_PORT_LAN;
+	if (entry->upstream)
+		zx279133_fast_reply_key_build(entry->reply_key, &data, &xlate,
+					      ip_proto, ipv6);
 
 	mutex_lock(&offload->eth->datapath_lock);
 	mutex_lock(&offload->lock);
@@ -928,27 +1013,79 @@ static int zx279133_flow_replace(struct zx279133_flow_offload *offload,
 		ret = -ENETDOWN;
 		goto out_free;
 	}
-	if (xa_load(&offload->flows, f->cookie)) {
-		ret = 0;
+	peer = xa_load(&offload->flows, f->cookie);
+	if (peer) {
+		ret = peer->refused ? -EOPNOTSUPP : 0;
+		goto out_free;
+	}
+	/*
+	 * The hardware adds a PPPoE header only on the way out of the WAN
+	 * port: an entry for a session on a LAN port, a second WAN, is never
+	 * hit. Refuse it, but remember the flow, so that its other half,
+	 * which comes in PPPoE, is refused too.
+	 */
+	if (entry->lan_routed && pppoe_sid) {
+		entry->refused = true;
+		entry->pppoe = true;
+		ret = xa_err(xa_store(&offload->flows, f->cookie, entry,
+				      GFP_KERNEL));
+		if (ret)
+			goto out_free;
+		entry->reply_indexed =
+			!rhashtable_lookup_insert_fast(&offload->reply_flows,
+						       &entry->reply_node,
+						       zx279133_flow_reply_ht_params);
+		entry = NULL;
+		ret = -EOPNOTSUPP;
 		goto out_free;
 	}
 	if (zx279133_flow_key_exists(offload, entry->key)) {
 		ret = -EEXIST;
 		goto out_free;
 	}
-	if (!pppoe_sid && ingress == ZX279133_FLOW_PORT_LAN &&
-	    offload->pppoe_users) {
-		ret = -EOPNOTSUPP;
-		goto out_free;
+	if (entry->upstream) {
+		pppoe = pppoe_sid;
+		/*
+		 * The LAN entry program does not take a PPPoE header off
+		 * either: the frames of a PPPoE session on a LAN port miss the
+		 * flow table and reach the CPU. Their rule does not say it, but
+		 * the refused rule of the other half does.
+		 */
+		peer = entry->lan_routed && !pppoe ?
+			rhashtable_lookup_fast(&offload->reply_flows,
+					       entry->key,
+					       zx279133_flow_reply_ht_params) :
+			NULL;
+		if (peer && peer->pppoe) {
+			ret = -EOPNOTSUPP;
+			goto out_free;
+		}
+	} else {
+		/*
+		 * A downstream rule does not say whether its packets arrive
+		 * in PPPoE; the upstream rule of the same connection does,
+		 * by pushing it. Take the answer from that rule, and wait
+		 * while it is not in hardware yet: nf_flow_table offers this
+		 * rule again once its packets take the software path, by
+		 * then after the upstream half. Guessing instead breaks a
+		 * connection opened from the WAN, whose downstream half
+		 * comes first: the hardware matches PPPoE frames by the inner
+		 * tuple and would pass them to the LAN still encapsulated.
+		 */
+		peer = rhashtable_lookup_fast(&offload->reply_flows, entry->key,
+					      zx279133_flow_reply_ht_params);
+		if (!peer) {
+			ret = -EAGAIN;
+			goto out_free;
+		}
+		pppoe = peer->pppoe;
 	}
-	pppoe = pppoe_sid || (ingress == ZX279133_FLOW_PORT_WAN &&
-				      offload->pppoe_users);
-	/* Keep both PPPoE directions out of the finite IKEY table. */
-	full = pppoe;
-	/* The local-fast action used for PPPoE push has no SDT29 flow-stat
-	 * operation.  PPPoE pop uses action 0 and retains exact counters.
+	/*
+	 * PPPoE pop stays out of the finite IKEY table in a full entry. The
+	 * push needs the IKEY of a multi entry, as np.ko builds it: the LAN
+	 * entry program adds the header only on that path.
 	 */
-	stat_capable = !full || ingress == ZX279133_FLOW_PORT_WAN;
+	full = pppoe && !entry->upstream;
 	entry->pppoe = pppoe;
 	entry->full = full;
 	entry->has_age = true;
@@ -967,40 +1104,34 @@ static int zx279133_flow_replace(struct zx279133_flow_offload *offload,
 	ret = zx279133_fast_age_alloc(offload, &entry->age);
 	if (ret)
 		goto out_release_ikey;
-	if (stat_capable) {
-		ret = zx279133_fast_index_alloc(offload->stat_used,
-						ZX279133_FAST_STAT_DEPTH,
-						&entry->stat);
-		if (!ret) {
-			entry->has_stat = true;
-			ret = zx279133_fast_stats_read(offload->eth, entry->stat,
-						       &entry->packets,
-						       &entry->bytes);
-			if (ret)
-				goto out_release_stat;
-		} else if (ret != -ENOSPC) {
-			goto out_release_age;
-		}
-	}
-	if (snat) {
-		ret = zx279133_flow_snat_get(offload, xlate.src_addr);
+	ret = zx279133_fast_index_alloc(offload->stat_used,
+					ZX279133_FAST_STAT_DEPTH, &entry->stat);
+	if (!ret) {
+		entry->has_stat = true;
+		ret = zx279133_fast_stats_read(offload->eth, entry->stat,
+					       &entry->packets, &entry->bytes);
 		if (ret)
 			goto out_release_stat;
+	} else if (ret != -ENOSPC) {
+		goto out_release_age;
 	}
-	if (pppoe) {
-		u16 sid = pppoe_sid ?: offload->pppoe_sid;
-
-		ret = zx279133_flow_pppoe_get(offload, sid);
-		if (ret)
-			goto out_put_snat;
+	ether_addr_copy(profile.mac, data.eth.h_source);
+	if (snat)
+		profile.sip = be32_to_cpu(xlate.src_addr);
+	if (pppoe && entry->upstream) {
+		profile.pppoe = ZX279133_WANID_PPPOE_PUSH;
+		profile.sid = pppoe_sid;
+	} else if (pppoe) {
+		profile.pppoe = ZX279133_WANID_PPPOE_POP;
 	}
-	zx279133_fast_response_build(fast, &data, &xlate, ingress, lan_vid,
-				     entry->ikey, entry->stat,
-				     entry->has_stat, pppoe);
+	ret = zx279133_wanid_get(offload->eth, !entry->upstream, &profile,
+				 &entry->wanid);
+	if (ret)
+		goto out_release_stat;
+	zx279133_fast_response_build(fast, &data, &xlate, ingress, egress,
+				     gemport, entry->ikey, entry->stat,
+				     entry->has_stat, pppoe, entry->wanid);
 	if (full) {
-		/* Local-fast push is action 1; routed pop remains action 0. */
-		if (ingress == ZX279133_FLOW_PORT_LAN)
-			fast[31] = 1;
 		zx279133_fast_full_table_build(table, fast, entry->key,
 					       entry->age);
 	} else {
@@ -1008,7 +1139,7 @@ static int zx279133_flow_replace(struct zx279133_flow_offload *offload,
 		zx279133_fast_multi_table_build(table, fast, entry->key, entry->age);
 		ret = zx279133_fast_ikey_write(offload->eth, entry->ikey, ikey);
 		if (ret)
-			goto out_put_pppoe;
+			goto out_put_wanid;
 	}
 	ret = xa_err(xa_store(&offload->flows, f->cookie, entry, GFP_KERNEL));
 	if (ret)
@@ -1027,6 +1158,26 @@ static int zx279133_flow_replace(struct zx279133_flow_offload *offload,
 		xa_erase(&offload->flows, f->cookie);
 		goto out_clear_ikey;
 	}
+	/* An unindexed entry only keeps its reply in software. */
+	if (entry->upstream)
+		entry->reply_indexed =
+			!rhashtable_lookup_insert_fast(&offload->reply_flows,
+						       &entry->reply_node,
+						       zx279133_flow_reply_ht_params);
+	/*
+	 * A flow out of a LAN port tells where its host is: give the host the
+	 * SDT 9 entry its frames need to reach the flow table, both for a LAN
+	 * client and for the gateway behind a LAN port used as a second WAN.
+	 * Without one they still work, through the CPU.
+	 */
+	if (egress == ZX279133_FLOW_PORT_LAN) {
+		entry->host = zx279133_host_get(offload, data.eth.h_dest,
+						gemport);
+		if (!entry->host)
+			dev_warn_ratelimited(offload->eth->dev,
+					     "no MAC table entry for %pM\n",
+					     data.eth.h_dest);
+	}
 	mutex_unlock(&offload->lock);
 	mutex_unlock(&offload->eth->datapath_lock);
 	return 0;
@@ -1036,12 +1187,8 @@ out_clear_ikey:
 		memset(ikey, 0, sizeof(ikey));
 		zx279133_fast_ikey_write(offload->eth, entry->ikey, ikey);
 	}
-out_put_pppoe:
-	if (entry->pppoe)
-		zx279133_flow_pppoe_put(offload);
-out_put_snat:
-	if (snat)
-		zx279133_flow_snat_put(offload);
+out_put_wanid:
+	zx279133_wanid_put(offload->eth, entry->wanid, snat);
 out_release_stat:
 	if (entry->has_stat)
 		__clear_bit(entry->stat, offload->stat_used);
@@ -1087,6 +1234,48 @@ zx279133_flow_entry_hw_clear(struct zx279133_flow_offload *offload,
 	return 0;
 }
 
+static void zx279133_flow_entry_unindex(struct zx279133_flow_offload *offload,
+					struct zx279133_flow_entry *entry)
+{
+	if (entry->reply_indexed)
+		rhashtable_remove_fast(&offload->reply_flows,
+				       &entry->reply_node,
+				       zx279133_flow_reply_ht_params);
+}
+
+/* Take one entry out of the hardware and the driver; offload->lock held. */
+static int zx279133_flow_entry_remove(struct zx279133_flow_offload *offload,
+				      struct zx279133_flow_entry *entry,
+				      unsigned long cookie)
+{
+	int ret;
+
+	if (entry->refused) {
+		zx279133_flow_entry_unindex(offload, entry);
+		xa_erase(&offload->flows, cookie);
+		kfree(entry);
+		return 0;
+	}
+	ret = zx279133_flow_entry_hw_clear(offload, entry);
+	if (ret)
+		return ret;
+	rhashtable_remove_fast(&offload->key_flows, &entry->key_node,
+			       zx279133_flow_key_ht_params);
+	zx279133_flow_entry_unindex(offload, entry);
+	xa_erase(&offload->flows, cookie);
+	zx279133_flow_slot_release(offload, entry);
+	if (!entry->full)
+		__clear_bit(entry->ikey, offload->ikey_used);
+	__clear_bit(entry->age, offload->age_used);
+	if (entry->has_stat)
+		__clear_bit(entry->stat, offload->stat_used);
+	zx279133_wanid_put(offload->eth, entry->wanid, entry->snat);
+	zx279133_host_put(offload, entry->host);
+	kfree(entry);
+
+	return 0;
+}
+
 static int zx279133_flow_destroy(struct zx279133_flow_offload *offload,
 				 struct flow_cls_offload *f)
 {
@@ -1095,31 +1284,32 @@ static int zx279133_flow_destroy(struct zx279133_flow_offload *offload,
 
 	mutex_lock(&offload->lock);
 	entry = xa_load(&offload->flows, f->cookie);
-	if (!entry) {
-		ret = -ENOENT;
-		goto out_unlock;
-	}
-	ret = zx279133_flow_entry_hw_clear(offload, entry);
-	if (ret)
-		goto out_unlock;
-	rhashtable_remove_fast(&offload->key_flows, &entry->key_node,
-			       zx279133_flow_key_ht_params);
-	xa_erase(&offload->flows, f->cookie);
-	zx279133_flow_slot_release(offload, entry);
-	if (!entry->full)
-		__clear_bit(entry->ikey, offload->ikey_used);
-	__clear_bit(entry->age, offload->age_used);
-	if (entry->has_stat)
-		__clear_bit(entry->stat, offload->stat_used);
-	if (entry->pppoe)
-		zx279133_flow_pppoe_put(offload);
-	if (entry->snat)
-		zx279133_flow_snat_put(offload);
-	kfree(entry);
-
-out_unlock:
+	ret = entry ? zx279133_flow_entry_remove(offload, entry, f->cookie) :
+		      -ENOENT;
 	mutex_unlock(&offload->lock);
 	return ret;
+}
+
+/*
+ * nf_tables unbinds a flowtable from its devices before it tears its flows
+ * down, so their DESTROY commands no longer reach the driver. When the last
+ * device of a flowtable is unbound, remove what that flowtable left behind;
+ * a firewall reload binds the new flowtable first, so the driver would
+ * otherwise keep the old entries and everything they hold.
+ */
+static void zx279133_flow_entries_clear_block(struct zx279133_flow_offload *offload,
+					      const struct flow_block *fblock)
+{
+	struct zx279133_flow_entry *entry;
+	unsigned long index;
+
+	mutex_lock(&offload->lock);
+	xa_for_each(&offload->flows, index, entry)
+		if (entry->fblock == fblock &&
+		    zx279133_flow_entry_remove(offload, entry, index))
+			dev_warn(offload->eth->dev,
+				 "failed to clear hardware flow %lu\n", index);
+	mutex_unlock(&offload->lock);
 }
 
 static int zx279133_flow_stats(struct zx279133_flow_offload *offload,
@@ -1133,7 +1323,7 @@ static int zx279133_flow_stats(struct zx279133_flow_offload *offload,
 
 	mutex_lock(&offload->lock);
 	entry = xa_load(&offload->flows, f->cookie);
-	if (!entry) {
+	if (!entry || entry->refused) {
 		ret = -ENOENT;
 		goto out_unlock;
 	}
@@ -1168,12 +1358,12 @@ out_unlock:
 }
 
 static int zx279133_flow_command(struct zx279133_flow_offload *offload,
-				  struct net_device *bind_dev,
+				  struct zx279133_flow_block *block,
 				  struct flow_cls_offload *f)
 {
 	switch (f->command) {
 	case FLOW_CLS_REPLACE:
-		return zx279133_flow_replace(offload, bind_dev, f);
+		return zx279133_flow_replace(offload, block, f);
 	case FLOW_CLS_DESTROY:
 		return zx279133_flow_destroy(offload, f);
 	case FLOW_CLS_STATS:
@@ -1191,7 +1381,7 @@ static int zx279133_flow_block_cb(enum tc_setup_type type, void *type_data,
 
 	if (type != TC_SETUP_CLSFLOWER)
 		return -EOPNOTSUPP;
-	return zx279133_flow_command(block->offload, block->ndev, f);
+	return zx279133_flow_command(block->offload, block, f);
 }
 
 static void zx279133_flow_block_release(void *cb_priv)
@@ -1203,23 +1393,29 @@ static void
 zx279133_flow_entries_clear(struct zx279133_flow_offload *offload,
 			    bool clear_hardware)
 {
+	struct zx279133_flow_host *host, *next;
 	struct zx279133_flow_entry *entry;
 	unsigned long index;
 
 	mutex_lock(&offload->lock);
 	xa_for_each(&offload->flows, index, entry) {
+		if (entry->refused) {
+			zx279133_flow_entry_unindex(offload, entry);
+			kfree(entry);
+			continue;
+		}
 		if (clear_hardware &&
 		    zx279133_flow_entry_hw_clear(offload, entry))
 			dev_warn(offload->eth->dev,
 				 "failed to clear hardware flow %lu\n", index);
-		if (entry->pppoe)
-			zx279133_flow_pppoe_put(offload);
-		if (entry->snat)
-			zx279133_flow_snat_put(offload);
+		zx279133_wanid_put(offload->eth, entry->wanid, entry->snat);
 		rhashtable_remove_fast(&offload->key_flows, &entry->key_node,
 				       zx279133_flow_key_ht_params);
+		zx279133_flow_entry_unindex(offload, entry);
 		kfree(entry);
 	}
+	list_for_each_entry_safe(host, next, &offload->hosts, node)
+		zx279133_host_free(offload, host, clear_hardware);
 	xa_destroy(&offload->flows);
 	xa_init(&offload->flows);
 	bitmap_zero(offload->zcam_used, ZX279133_ZCAM_SLOTS);
@@ -1230,6 +1426,21 @@ zx279133_flow_entries_clear(struct zx279133_flow_offload *offload,
 	offload->fast_full_zcam_used = 0;
 	offload->ddr_entries = 0;
 	mutex_unlock(&offload->lock);
+}
+
+/* Whether a device of this flowtable is still bound to the driver. */
+static bool zx279133_flow_block_bound(struct zx279133_flow_offload *offload,
+				      const struct flow_block *fblock)
+{
+	struct flow_block_cb *block_cb;
+
+	list_for_each_entry(block_cb, &offload->block_cb_list, driver_list) {
+		struct zx279133_flow_block *block = block_cb->cb_priv;
+
+		if (block->fblock == fblock)
+			return true;
+	}
+	return false;
 }
 
 static int zx279133_flow_setup_block(struct zx279133_flow_offload *offload,
@@ -1257,6 +1468,7 @@ static int zx279133_flow_setup_block(struct zx279133_flow_offload *offload,
 			return -ENOMEM;
 		block->offload = offload;
 		block->ndev = ndev;
+		block->fblock = f->block;
 		block_cb = flow_block_cb_alloc(cb, ndev, block,
 					       zx279133_flow_block_release);
 		if (IS_ERR(block_cb)) {
@@ -1274,8 +1486,9 @@ static int zx279133_flow_setup_block(struct zx279133_flow_offload *offload,
 		if (!flow_block_cb_decref(block_cb)) {
 			flow_block_cb_remove(block_cb, f);
 			list_del(&block_cb->driver_list);
-			if (list_empty(&offload->block_cb_list))
-				zx279133_flow_entries_clear(offload, true);
+			if (!zx279133_flow_block_bound(offload, f->block))
+				zx279133_flow_entries_clear_block(offload,
+								  f->block);
 		}
 		return 0;
 	default:
@@ -1308,14 +1521,162 @@ void zx279133_flow_offload_flush(struct zx279133_eth *eth)
 	zx279133_flow_entries_clear(eth->flow_offload, false);
 }
 
+/* Take every flow out of the hardware too, which stays up. */
+void zx279133_flow_offload_reset(struct zx279133_eth *eth)
+{
+	if (eth->flow_offload)
+		zx279133_flow_entries_clear(eth->flow_offload, true);
+}
+
+static struct zx279133_eth *zx279133_wan_ports_eth(struct device *dev)
+{
+	struct zx279133_lan_service *service = dev_get_drvdata(dev);
+
+	return service ? container_of(service, struct zx279133_eth,
+				      lan_service) : NULL;
+}
+
+/*
+ * wan_ports: the LAN ports switched to WAN-type, by name. Writing
+ * "<port> 1" switches one, "<port> 0" switches it back; userspace does it
+ * for the ports its firewall puts in a WAN zone.
+ */
+static ssize_t wan_ports_show(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	struct zx279133_eth *eth = zx279133_wan_ports_eth(dev);
+	unsigned long wan_vports;
+	struct net_device *ndev;
+	int n = 0;
+	u16 vid;
+
+	if (!eth)
+		return -ENODEV;
+	wan_vports = READ_ONCE(eth->lan_wan_vports);
+	rcu_read_lock();
+	for_each_netdev_rcu(&init_net, ndev)
+		if (!zx279133_flow_lan_vid(eth, ndev, &vid) &&
+		    wan_vports & BIT(vid - ZX279133_LAN_TRANSPORT_VID_MIN))
+			n += sysfs_emit_at(buf, n, "%s ", ndev->name);
+	rcu_read_unlock();
+	n += sysfs_emit_at(buf, n, "\n");
+
+	return n;
+}
+
+static ssize_t wan_ports_store(struct device *dev,
+			       struct device_attribute *attr,
+			       const char *buf, size_t count)
+{
+	struct zx279133_eth *eth = zx279133_wan_ports_eth(dev);
+	struct net_device *ndev;
+	char name[IFNAMSIZ];
+	unsigned int wan;
+	int ret;
+	u16 vid;
+
+	if (!eth)
+		return -ENODEV;
+	if (sscanf(buf, "%15s %u", name, &wan) != 2 || wan > 1)
+		return -EINVAL;
+	ndev = dev_get_by_name(&init_net, name);
+	if (!ndev)
+		return -ENODEV;
+	ret = zx279133_flow_lan_vid(eth, ndev, &vid);
+	/* A bridged port is a LAN port. */
+	if (!ret && wan && netif_is_bridge_port(ndev))
+		ret = -EBUSY;
+	dev_put(ndev);
+	if (ret)
+		return ret == -EBUSY ? ret : -EINVAL;
+	ret = zx279133_lan_vport_wan_set(eth, vid, wan);
+
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_RW(wan_ports);
+
+static struct attribute *zx279133_wan_ports_attrs[] = {
+	&dev_attr_wan_ports.attr,
+	NULL
+};
+
+static const struct attribute_group zx279133_wan_ports_group = {
+	.attrs = zx279133_wan_ports_attrs,
+};
+
 static void zx279133_flow_offload_cleanup(void *data)
 {
 	struct zx279133_flow_offload *offload = data;
 
 	zx279133_flow_entries_clear(offload, false);
+	rhashtable_destroy(&offload->reply_flows);
 	rhashtable_destroy(&offload->key_flows);
 	offload->eth->flow_offload = NULL;
 }
+
+#ifdef CONFIG_DEBUG_FS
+/* One line per hardware flow, with the SDT29 counters read live. */
+static int zx279133_flows_show(struct seq_file *s, void *unused)
+{
+	struct zx279133_flow_offload *offload = s->private;
+	struct zx279133_flow_entry *entry;
+	struct zx279133_flow_host *host;
+	unsigned long index;
+	u64 packets, bytes;
+
+	mutex_lock(&offload->lock);
+	xa_for_each(&offload->flows, index, entry) {
+		if (entry->refused) {
+			seq_printf(s, "%16phN lan refused pppoe\n", entry->key);
+			continue;
+		}
+		seq_printf(s, "%16phN %s %s wanid %u pppoe %d snat %d age %u",
+			   entry->key, entry->lan_routed ? "lan" :
+			   entry->upstream ? "up" : "down",
+			   entry->full ? "full" : "multi", entry->wanid,
+			   entry->pppoe, entry->snat, entry->age);
+		if (entry->in_ddr)
+			seq_printf(s, " ddr %u", entry->ddr_bucket);
+		else
+			seq_printf(s, " zcam %u/%u/%u", entry->zblock,
+				   entry->zcell, entry->zaddr);
+		if (entry->has_stat &&
+		    !zx279133_fast_stats_read(offload->eth, entry->stat,
+					      &packets, &bytes))
+			seq_printf(s, " stat %u packets %llu bytes %llu",
+				   entry->stat, packets, bytes);
+		seq_putc(s, '\n');
+	}
+	list_for_each_entry(host, &offload->hosts, node)
+		seq_printf(s, "host %pM port %u zcam %u/%u/%u flows %u\n",
+			   host->mac, host->port, host->zblock, host->zcell,
+			   host->zaddr, host->users);
+	mutex_unlock(&offload->lock);
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(zx279133_flows);
+
+static void zx279133_flows_debugfs_remove(void *data)
+{
+	debugfs_remove(data);
+}
+
+static int zx279133_flows_debugfs_init(struct zx279133_flow_offload *offload)
+{
+	struct dentry *dentry;
+
+	dentry = debugfs_create_file("zx279133-flows", 0400, NULL, offload,
+				     &zx279133_flows_fops);
+	return devm_add_action_or_reset(offload->eth->dev,
+					zx279133_flows_debugfs_remove, dentry);
+}
+#else
+static int zx279133_flows_debugfs_init(struct zx279133_flow_offload *offload)
+{
+	return 0;
+}
+#endif
 
 int zx279133_flow_offload_init(struct zx279133_eth *eth)
 {
@@ -1336,9 +1697,24 @@ int zx279133_flow_offload_init(struct zx279133_eth *eth)
 			      &zx279133_flow_key_ht_params);
 	if (ret)
 		return ret;
+	ret = rhashtable_init(&offload->reply_flows,
+			      &zx279133_flow_reply_ht_params);
+	if (ret) {
+		rhashtable_destroy(&offload->key_flows);
+		return ret;
+	}
 	INIT_LIST_HEAD(&offload->block_cb_list);
+	INIT_LIST_HEAD(&offload->hosts);
 	eth->flow_offload = offload;
 
-	return devm_add_action_or_reset(eth->dev,
-					zx279133_flow_offload_cleanup, offload);
+	ret = devm_add_action_or_reset(eth->dev,
+				       zx279133_flow_offload_cleanup, offload);
+	if (ret)
+		return ret;
+
+	ret = devm_device_add_group(eth->dev, &zx279133_wan_ports_group);
+	if (ret)
+		return ret;
+
+	return zx279133_flows_debugfs_init(offload);
 }

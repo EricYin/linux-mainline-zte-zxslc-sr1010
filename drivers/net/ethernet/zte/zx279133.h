@@ -283,10 +283,20 @@
 #define ZX279133_SPA_MAC_LO_VALUE	0x7fff
 #define ZX279133_SPA_MAC_LO_MASK	GENMASK(15, 0)
 #define ZX279133_SPA_ONU_COUNT		16
+/*
+ * Registers 0..7 hold the MAC addresses the WAN accepts; 8..15 are the
+ * factory's per-WAN local MACs (sw_mac_add_cpu_macaddress()), a different
+ * table.
+ */
+#define ZX279133_SPA_ONU_MAC_SLOTS	8
 #define ZX279133_SPA_TRAP_DMAC_COUNT	4
 #define ZX279133_WANID_COUNT		32
 #define ZX279133_WANID_CPU_MAC_COUNT	2
 #define ZX279133_WANID_L3_MTU		1996
+/* WANID bit 4 selects the downstream (WAN-to-LAN) half of the table. */
+#define ZX279133_WANID_DOWNSTREAM	BIT(4)
+#define ZX279133_WANID_PPPOE_PUSH	1
+#define ZX279133_WANID_PPPOE_POP	2
 #define ZX279133_GLB_OAM_EN		0x10
 #define ZX279133_GLB_OAM_MASK		GENMASK(19, 14)
 #define ZX279133_GLB_OAM_VALUE		0xf0000
@@ -438,6 +448,8 @@ static inline u32 zx279133_idm_tx_done_reg(unsigned int queue)
 	return queue == 0 ? 0x0084 : 4 * (queue + 42);
 }
 
+/* XMAC0 carries the LAN; the RTL8372N driver owns it. */
+#define ZX279133_XMAC0_BASE	0x140000
 #define ZX279133_XMAC1_BASE	0x180000
 #define ZX279133_XMAC_TX_CTRL	0x0000
 #define ZX279133_XMAC_RX_CTRL	0x0010
@@ -573,10 +585,38 @@ struct zx279133_rx_stats {
 	u64_stats_t foreign_pages;
 };
 
+/*
+ * What a flow needs from the WANID entry its fast response selects: the
+ * source MAC of every frame the flow sends, the source-NAT address (0 when
+ * the flow does not source-NAT), and the PPPoE rewrite with its session ID.
+ */
+struct zx279133_wanid_profile {
+	u8 mac[ETH_ALEN];
+	u32 sip;
+	u16 sid;
+	u8 pppoe;
+};
+
+/*
+ * One WANID entry lent to flows that share a profile. The entry's own image
+ * is saved on first use and written back when the last flow returns it.
+ */
+struct zx279133_wanid_slot {
+	struct zx279133_wanid_profile profile;
+	u32 saved[ZX279133_SMMU0_WORDS];
+	unsigned int users;
+	unsigned int snat_users;
+};
+
 struct zx279133_eth {
 	struct device *dev;
 	struct net_device *ndev;
 	struct net_device *lan_ndev;
+	/*
+	 * LAN ports switched to WAN-type in the PPU, one bit per transport VID
+	 * from ZX279133_LAN_TRANSPORT_VID_MIN; written under datapath_lock.
+	 */
+	unsigned long lan_wan_vports;
 	struct zx279133_flow_offload *flow_offload;
 	struct zx279133_lan_service lan_service;
 	struct zx279133_netdev_stats stats;
@@ -682,10 +722,13 @@ struct zx279133_eth {
 	struct mutex np_ind_lock;
 	/* Serializes read-modify-write of shared WANID table entries. */
 	struct mutex wanid_lock;
+	struct zx279133_wanid_slot wanid[ZX279133_WANID_COUNT];
 	struct napi_struct napi;
 	struct napi_struct lan_napi;
 	struct delayed_work tx_reclaim_work;
 	struct delayed_work rx_refill_work;
+	/* Copies the WAN unicast list (macvlans) into the SPA ONU MAC slots. */
+	struct work_struct rx_mode_work;
 	struct ptp_clock_info ptp_info;
 	struct ptp_clock *ptp_clock;
 	u32 ptp_agc_saved;
@@ -783,15 +826,24 @@ void zx279133_np_restore(struct zx279133_eth *eth);
 void zx279133_route_set(struct zx279133_eth *eth, bool enabled);
 int zx279133_vlan_runtime_prepare(struct zx279133_eth *eth);
 int zx279133_wan_port_bringup(struct zx279133_eth *eth);
+void zx279133_program_spa_uc_macs(struct zx279133_eth *eth);
+int zx279133_lan_vport_wan_set(struct zx279133_eth *eth, u16 vport, bool wan);
+void zx279133_rx_mode_work(struct work_struct *work);
 void zx279133_program_spa_cpu_mac(struct zx279133_eth *eth,
 				  const unsigned char *addr);
 int zx279133_program_wanid_cpu_mac(struct zx279133_eth *eth,
 				   const unsigned char *addr);
-int zx279133_program_wanid_sip(struct zx279133_eth *eth, u32 wanid,
-			       u32 sip, u32 *old_sip);
-int zx279133_program_wanid_pppoe(struct zx279133_eth *eth, u32 wanid,
-				 u8 mode, u16 sid, u8 *old_mode,
-				 u16 *old_sid);
+int zx279133_wanid_get(struct zx279133_eth *eth, bool downstream,
+		       const struct zx279133_wanid_profile *profile, u8 *wanid);
+void zx279133_wanid_put(struct zx279133_eth *eth, u8 wanid, bool snat);
+#ifdef CONFIG_DEBUG_FS
+int zx279133_wanid_debugfs_init(struct zx279133_eth *eth);
+#else
+static inline int zx279133_wanid_debugfs_init(struct zx279133_eth *eth)
+{
+	return 0;
+}
+#endif
 int zx279133_fast_ikey_write(struct zx279133_eth *eth, u32 index,
 			     const u32 *data);
 int zx279133_fast_stats_read(struct zx279133_eth *eth, u16 flow_id,
@@ -800,6 +852,7 @@ int zx279133_fast_age_read_clear(struct zx279133_eth *eth, u32 age,
 				 bool *used);
 int zx279133_flow_offload_init(struct zx279133_eth *eth);
 void zx279133_flow_offload_flush(struct zx279133_eth *eth);
+void zx279133_flow_offload_reset(struct zx279133_eth *eth);
 bool zx279133_flow_offload_active(struct zx279133_eth *eth);
 int zx279133_flow_offload_setup_tc(struct zx279133_eth *eth,
 				   struct net_device *ndev,
@@ -851,6 +904,7 @@ int zx279133_get_ts_info(struct net_device *ndev,
 
 int zx279133_hardware_prepare(struct zx279133_eth *eth);
 void zx279133_hardware_unprepare(struct zx279133_eth *eth);
+void zx279133_shutdown(struct zx279133_eth *eth);
 extern const struct ethtool_ops zx279133_ethtool_ops;
 extern const struct net_device_ops zx279133_netdev_ops;
 extern const struct zx279133_lan_service_ops zx279133_lan_service_ops;

@@ -4241,8 +4241,13 @@ zx279133_rtl8372n_port_bridge_join(struct dsa_switch *ds, int port,
 	mutex_lock(&priv->switch_mdiodev->bus->mdio_lock);
 	ret = rtl8372n_isolation_program(ds, priv->isolated_mask);
 	mutex_unlock(&priv->switch_mdiodev->bus->mdio_lock);
+	if (ret)
+		return ret;
 
-	return ret;
+	/* A bridged port is a LAN port, whatever it served as before. */
+	return zx279133_lan_service_port_wan_set(priv->service,
+						 RTL8372N_TRANSPORT_VID_BASE +
+						 port, false);
 }
 
 static void
