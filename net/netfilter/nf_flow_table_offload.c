@@ -987,15 +987,6 @@ out:
 	nf_flow_offload_destroy(flow_rule);
 }
 
-static void flow_offload_work_del(struct flow_offload_work *offload)
-{
-	clear_bit(IPS_HW_OFFLOAD_BIT, &offload->flow->ct->status);
-	flow_offload_tuple_del(offload, FLOW_OFFLOAD_DIR_ORIGINAL);
-	if (test_bit(NF_FLOW_HW_BIDIRECTIONAL, &offload->flow->flags))
-		flow_offload_tuple_del(offload, FLOW_OFFLOAD_DIR_REPLY);
-	set_bit(NF_FLOW_HW_DEAD, &offload->flow->flags);
-}
-
 static void flow_offload_tuple_stats(struct flow_offload_work *offload,
 				     enum flow_offload_tuple_dir dir,
 				     struct flow_stats *stats)
@@ -1030,6 +1021,22 @@ static void flow_offload_work_stats(struct flow_offload_work *offload)
 				       FLOW_OFFLOAD_DIR_REPLY,
 				       stats[1].pkts, stats[1].bytes);
 	}
+}
+
+static void flow_offload_work_del(struct flow_offload_work *offload)
+{
+	/*
+	 * Statistics are only polled once the flow timeout has run down by a
+	 * tenth, so up to several seconds of traffic forwarded in hardware are
+	 * not yet in the conntrack counters when the flow is torn down. Collect
+	 * them before the rules, and the counters with them, are gone.
+	 */
+	flow_offload_work_stats(offload);
+	clear_bit(IPS_HW_OFFLOAD_BIT, &offload->flow->ct->status);
+	flow_offload_tuple_del(offload, FLOW_OFFLOAD_DIR_ORIGINAL);
+	if (test_bit(NF_FLOW_HW_BIDIRECTIONAL, &offload->flow->flags))
+		flow_offload_tuple_del(offload, FLOW_OFFLOAD_DIR_REPLY);
+	set_bit(NF_FLOW_HW_DEAD, &offload->flow->flags);
 }
 
 static void flow_offload_work_handler(struct work_struct *work)
