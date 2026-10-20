@@ -92,7 +92,7 @@
 			default-state = "off";
 			function = LED_FUNCTION_LAN;
 			function-enumerator = <1>;
-			gpios = <&gpio4 5 GPIO_ACTIVE_LOW>;
+			gpios = <&gpio0 2 GPIO_ACTIVE_LOW>;
 			label = "sr1010:lan1";
 			linux,default-trigger = "netdev";
 		};
@@ -101,7 +101,7 @@
 			default-state = "off";
 			function = LED_FUNCTION_LAN;
 			function-enumerator = <2>;
-			gpios = <&gpio4 4 GPIO_ACTIVE_LOW>;
+			gpios = <&gpio0 13 GPIO_ACTIVE_LOW>;
 			label = "sr1010:lan2";
 			linux,default-trigger = "netdev";
 		};
@@ -110,7 +110,7 @@
 			default-state = "off";
 			function = LED_FUNCTION_LAN;
 			function-enumerator = <3>;
-			gpios = <&gpio0 13 GPIO_ACTIVE_LOW>;
+			gpios = <&gpio4 4 GPIO_ACTIVE_LOW>;
 			label = "sr1010:lan3";
 			linux,default-trigger = "netdev";
 		};
@@ -119,7 +119,7 @@
 			default-state = "off";
 			function = LED_FUNCTION_LAN;
 			function-enumerator = <4>;
-			gpios = <&gpio0 2 GPIO_ACTIVE_LOW>;
+			gpios = <&gpio4 5 GPIO_ACTIVE_LOW>;
 			label = "sr1010:lan4";
 			linux,default-trigger = "netdev";
 		};
@@ -183,27 +183,28 @@
 			#address-cells = <1>;
 			#size-cells = <0>;
 
+			/* Chassis LAN1..LAN4 correspond to switch ports 4..7. */
 			port@4 {
 				reg = <4>;
-				label = "lan4";
+				label = "lan1";
 				phy-mode = "internal";
 			};
 
 			port@5 {
 				reg = <5>;
-				label = "lan3";
+				label = "lan2";
 				phy-mode = "internal";
 			};
 
 			port@6 {
 				reg = <6>;
-				label = "lan2";
+				label = "lan3";
 				phy-mode = "internal";
 			};
 
 			port@7 {
 				reg = <7>;
-				label = "lan1";
+				label = "lan4";
 				phy-mode = "internal";
 			};
 
