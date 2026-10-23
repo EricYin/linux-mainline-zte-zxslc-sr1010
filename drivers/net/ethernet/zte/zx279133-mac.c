@@ -469,14 +469,18 @@ static void zx279133_xmac_set_pause(struct zx279133_eth *eth,
 static void zx279133_xmac_reset(struct zx279133_eth *eth)
 {
 	void __iomem *reset = eth->base + ZX279133_SYS_SOFT_RESET;
+	bool counting;
 	u32 value;
 
+	counting = zx279133_xmac_stats_stop(eth);
 	/* smac_reset(): preserve the shared reset word and pulse XMAC1 only. */
 	value = readl(reset);
 	writel(value & ~ZX279133_XMAC_RESET_MASK, reset);
 	/* Vendor smac_reset(): __const_udelay(1718000) ~= 1.718 ms. */
 	usleep_range(1718, 1818);
 	writel(value | ZX279133_XMAC_RESET_MASK, reset);
+	if (counting)
+		zx279133_xmac_stats_start(eth);
 }
 
 static int zx279133_xmac_2500basex_init(struct zx279133_eth *eth)

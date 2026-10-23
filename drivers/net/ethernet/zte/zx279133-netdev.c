@@ -971,12 +971,113 @@ zx279133_fill_stats64(struct net_device *ndev,
 	stats->rx_length_errors += atomic64_read(&sw_stats->rx_length_errors);
 }
 
+/* The 32-bit octet counters wrap after ~13.7 s at 2.5 Gbit/s. */
+#define ZX279133_XMAC_STATS_INTERVAL	(2 * HZ)
+
+static const u32 zx279133_xmac_stat_regs[ZX279133_XMAC_STATS] = {
+	[ZX279133_XMAC_RX_FRAMES] = ZX279133_XMAC_STAT_RX_FRAMES,
+	[ZX279133_XMAC_RX_OCTETS] = ZX279133_XMAC_STAT_RX_OCTETS,
+	[ZX279133_XMAC_TX_FRAMES] = ZX279133_XMAC_STAT_TX_FRAMES,
+	[ZX279133_XMAC_TX_OCTETS] = ZX279133_XMAC_STAT_TX_OCTETS,
+};
+
+static u32 zx279133_xmac_stat_read(struct zx279133_eth *eth, unsigned int i)
+{
+	return readl(eth->base + ZX279133_XMAC1_BASE +
+		     zx279133_xmac_stat_regs[i]);
+}
+
+static void zx279133_xmac_stats_update(struct zx279133_eth *eth)
+{
+	unsigned int i;
+	u32 now;
+
+	lockdep_assert_held(&eth->xmac_stats_lock);
+	if (!eth->xmac_stats_live)
+		return;
+
+	for (i = 0; i < ZX279133_XMAC_STATS; i++) {
+		now = zx279133_xmac_stat_read(eth, i);
+		eth->xmac_stats[i] += (u32)(now - eth->xmac_stats_last[i]);
+		eth->xmac_stats_last[i] = now;
+	}
+}
+
+/*
+ * Start counting from the current hardware values: called once the XMAC is
+ * clocked, and after an XMAC reset that may have cleared the counters.
+ */
+void zx279133_xmac_stats_start(struct zx279133_eth *eth)
+{
+	unsigned long flags;
+	unsigned int i;
+
+	spin_lock_irqsave(&eth->xmac_stats_lock, flags);
+	zx279133_xmac_stats_update(eth);
+	for (i = 0; i < ZX279133_XMAC_STATS; i++)
+		eth->xmac_stats_last[i] = zx279133_xmac_stat_read(eth, i);
+	eth->xmac_stats_live = true;
+	spin_unlock_irqrestore(&eth->xmac_stats_lock, flags);
+
+	mod_delayed_work(system_wq, &eth->xmac_stats_work,
+			 ZX279133_XMAC_STATS_INTERVAL);
+}
+
+/*
+ * Fold in what the hardware counted so far and stop reading it, before an
+ * XMAC reset or before its clocks go off.  Returns whether it was counting.
+ */
+bool zx279133_xmac_stats_stop(struct zx279133_eth *eth)
+{
+	unsigned long flags;
+	bool live;
+
+	spin_lock_irqsave(&eth->xmac_stats_lock, flags);
+	live = eth->xmac_stats_live;
+	zx279133_xmac_stats_update(eth);
+	eth->xmac_stats_live = false;
+	spin_unlock_irqrestore(&eth->xmac_stats_lock, flags);
+
+	return live;
+}
+
+void zx279133_xmac_stats_work(struct work_struct *work)
+{
+	struct zx279133_eth *eth =
+		container_of(to_delayed_work(work), struct zx279133_eth,
+			     xmac_stats_work);
+	unsigned long flags;
+	bool live;
+
+	spin_lock_irqsave(&eth->xmac_stats_lock, flags);
+	zx279133_xmac_stats_update(eth);
+	live = eth->xmac_stats_live;
+	spin_unlock_irqrestore(&eth->xmac_stats_lock, flags);
+
+	if (live)
+		schedule_delayed_work(&eth->xmac_stats_work,
+				      ZX279133_XMAC_STATS_INTERVAL);
+}
+
 static void zx279133_get_stats64(struct net_device *ndev,
 				 struct rtnl_link_stats64 *stats)
 {
 	struct zx279133_eth *eth = netdev_priv(ndev);
+	unsigned long flags;
 
 	zx279133_fill_stats64(ndev, &eth->stats, stats);
+
+	/*
+	 * Offloaded flows never reach the CPU, so take packets and bytes from
+	 * the XMAC, which sees every WAN frame; errors and drops stay software.
+	 */
+	spin_lock_irqsave(&eth->xmac_stats_lock, flags);
+	zx279133_xmac_stats_update(eth);
+	stats->rx_packets = eth->xmac_stats[ZX279133_XMAC_RX_FRAMES];
+	stats->rx_bytes = eth->xmac_stats[ZX279133_XMAC_RX_OCTETS];
+	stats->tx_packets = eth->xmac_stats[ZX279133_XMAC_TX_FRAMES];
+	stats->tx_bytes = eth->xmac_stats[ZX279133_XMAC_TX_OCTETS];
+	spin_unlock_irqrestore(&eth->xmac_stats_lock, flags);
 }
 
 static void zx279133_get_drvinfo(struct net_device *ndev,
@@ -1098,10 +1199,10 @@ enum zx279133_ethtool_stat {
 };
 
 static const char zx279133_gstrings_stats[ZX279133_STAT_COUNT][ETH_GSTRING_LEN] = {
-	"rx_packets",
-	"tx_packets",
-	"rx_bytes",
-	"tx_bytes",
+	"cpu_rx_packets",
+	"cpu_tx_packets",
+	"cpu_rx_bytes",
+	"cpu_tx_bytes",
 	"rx_errors",
 	"tx_errors",
 	"rx_dropped",

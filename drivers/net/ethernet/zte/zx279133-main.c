@@ -182,6 +182,7 @@ int zx279133_hardware_prepare(struct zx279133_eth *eth)
 	eth->serdes_interface = eth->host_interface;
 	usleep_range(2000, 2500);
 	eth->hardware_prepared = true;
+	zx279133_xmac_stats_start(eth);
 	zx279133_ptp_start(eth);
 
 	return 0;
@@ -205,6 +206,7 @@ void zx279133_hardware_unprepare(struct zx279133_eth *eth)
 	if (!eth->hardware_prepared)
 		return;
 
+	zx279133_xmac_stats_stop(eth);
 	zx279133_ptp_stop(eth);
 	zx279133_xmac_set_enabled(eth, false);
 	zx279133_flow_offload_flush(eth);
@@ -230,6 +232,13 @@ static void zx279133_rx_mode_work_cancel(void *data)
 	struct zx279133_eth *eth = data;
 
 	cancel_work_sync(&eth->rx_mode_work);
+}
+
+static void zx279133_xmac_stats_work_cancel(void *data)
+{
+	struct zx279133_eth *eth = data;
+
+	cancel_delayed_work_sync(&eth->xmac_stats_work);
 }
 
 static int zx279133_eth_probe(struct platform_device *pdev)
@@ -265,6 +274,8 @@ static int zx279133_eth_probe(struct platform_device *pdev)
 	if (!ndev->tstats)
 		return -ENOMEM;
 	zx279133_netdev_stats_init(&eth->stats);
+	spin_lock_init(&eth->xmac_stats_lock);
+	INIT_DELAYED_WORK(&eth->xmac_stats_work, zx279133_xmac_stats_work);
 	atomic64_set(&eth->rx_irq_count, 0);
 	atomic64_set(&eth->idm_local_irq_count, 0);
 	atomic64_set(&eth->rx_refill_retry_work_runs, 0);
@@ -657,6 +668,10 @@ static int zx279133_eth_probe(struct platform_device *pdev)
 	eth->rx_rss_map[1] = 0xf0;
 	/* Runs after the netdev is unregistered, when nothing queues it. */
 	ret = devm_add_action_or_reset(dev, zx279133_rx_mode_work_cancel, eth);
+	if (ret)
+		return ret;
+	ret = devm_add_action_or_reset(dev, zx279133_xmac_stats_work_cancel,
+				       eth);
 	if (ret)
 		return ret;
 	ret = devm_register_netdev(dev, ndev);

@@ -473,8 +473,17 @@ static inline u32 zx279133_idm_tx_done_reg(unsigned int queue)
 #define ZX279133_XMAC_EEE_ENABLE_MASK	0x000b0000
 #define ZX279133_XMAC_EEE_TIMER_MASK	GENMASK(31, 16)
 #define ZX279133_XMAC_EEE_TIMER_ENABLE	BIT(5)
+/*
+ * DW XGMAC MMC counters, low 32 bits.  np.ko addresses them as word indices
+ * from XMAC0 at 0x50000 (MMC 0x814 TX octets, 0x81c TX frames, 0x900 RX
+ * frames, 0x908 RX octets), so the byte offset is four times the index.
+ * Octets count the frame from DA through FCS.
+ */
+#define ZX279133_XMAC_STAT_TX_OCTETS	0x2050
 #define ZX279133_XMAC_STAT_TX_FRAMES	0x2070
 #define ZX279133_XMAC_STAT_TX_GOOD	0x20b0
+#define ZX279133_XMAC_STAT_RX_FRAMES	0x2400
+#define ZX279133_XMAC_STAT_RX_OCTETS	0x2420
 /* PTP/TOD registers are word-addressed as 0x704c..0x706a by np.ko. */
 #define ZX279133_PTP_AGC_CFG		0x2c0000
 #define ZX279133_PTP_AGC_WORK_CLOCKS	GENMASK(1, 0)
@@ -608,6 +617,14 @@ struct zx279133_wanid_slot {
 	unsigned int snat_users;
 };
 
+enum {
+	ZX279133_XMAC_RX_FRAMES,
+	ZX279133_XMAC_RX_OCTETS,
+	ZX279133_XMAC_TX_FRAMES,
+	ZX279133_XMAC_TX_OCTETS,
+	ZX279133_XMAC_STATS,
+};
+
 struct zx279133_eth {
 	struct device *dev;
 	struct net_device *ndev;
@@ -620,6 +637,16 @@ struct zx279133_eth {
 	struct zx279133_flow_offload *flow_offload;
 	struct zx279133_lan_service lan_service;
 	struct zx279133_netdev_stats stats;
+	/*
+	 * WAN XMAC counters folded into 64-bit totals.  The MMC is read only
+	 * while xmac_stats_live is set: between hardware prepare/unprepare and
+	 * outside an XMAC reset.  The lock protects all four fields.
+	 */
+	spinlock_t xmac_stats_lock;
+	struct delayed_work xmac_stats_work;
+	u64 xmac_stats[ZX279133_XMAC_STATS];
+	u32 xmac_stats_last[ZX279133_XMAC_STATS];
+	bool xmac_stats_live;
 	void __iomem *base;
 	void __iomem *pps_base;
 	struct regmap *pon_route;
@@ -901,6 +928,10 @@ void zx279133_ptp_start(struct zx279133_eth *eth);
 void zx279133_ptp_stop(struct zx279133_eth *eth);
 int zx279133_get_ts_info(struct net_device *ndev,
 			 struct kernel_ethtool_ts_info *info);
+
+void zx279133_xmac_stats_start(struct zx279133_eth *eth);
+bool zx279133_xmac_stats_stop(struct zx279133_eth *eth);
+void zx279133_xmac_stats_work(struct work_struct *work);
 
 int zx279133_hardware_prepare(struct zx279133_eth *eth);
 void zx279133_hardware_unprepare(struct zx279133_eth *eth);
