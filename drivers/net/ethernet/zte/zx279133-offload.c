@@ -6,6 +6,7 @@
 #include <linux/etherdevice.h>
 #include <linux/iopoll.h>
 #include <linux/ip.h>
+#include <linux/if_pppox.h>
 #include <linux/ipv6.h>
 #include <linux/jiffies.h>
 #include <linux/rhashtable.h>
@@ -1329,6 +1330,24 @@ static void zx279133_flow_entries_clear_block(struct zx279133_flow_offload *offl
 	mutex_unlock(&offload->lock);
 }
 
+/*
+ * A flow counter adds up the frame on the WAN side, from the MAC header
+ * through the FCS, with the PPPoE header of a session: IP + 18, or IP + 26,
+ * measured in both directions. nf_flow_table, like conntrack and the devices
+ * it passes the counts on to, counts the IP packet.
+ */
+static u64 zx279133_flow_ip_bytes(const struct zx279133_flow_entry *entry,
+				  u64 packets, u64 bytes)
+{
+	u64 frame = ETH_HLEN + ETH_FCS_LEN;
+
+	if (entry->pppoe)
+		frame += PPPOE_SES_HLEN;
+	frame *= packets;
+
+	return bytes > frame ? bytes - frame : 0;
+}
+
 static int zx279133_flow_stats(struct zx279133_flow_offload *offload,
 			       struct flow_cls_offload *f)
 {
@@ -1363,7 +1382,10 @@ static int zx279133_flow_stats(struct zx279133_flow_offload *offload,
 	    (packets != entry->packets || bytes != entry->bytes))
 		entry->lastused = jiffies;
 	lastused = entry->lastused;
-	flow_stats_update(&f->stats, bytes - entry->bytes,
+	flow_stats_update(&f->stats,
+			  zx279133_flow_ip_bytes(entry,
+						 packets - entry->packets,
+						 bytes - entry->bytes),
 			  packets - entry->packets, 0, lastused,
 			  FLOW_ACTION_HW_STATS_DELAYED);
 	entry->packets = packets;
