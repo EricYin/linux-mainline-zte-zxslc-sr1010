@@ -1000,6 +1000,7 @@ static void flow_offload_tuple_stats(struct flow_offload_work *offload,
 static void flow_offload_work_stats(struct flow_offload_work *offload)
 {
 	struct flow_stats stats[FLOW_OFFLOAD_DIR_MAX] = {};
+	enum flow_offload_tuple_dir dir;
 	u64 lastused;
 
 	flow_offload_tuple_stats(offload, FLOW_OFFLOAD_DIR_ORIGINAL, &stats[0]);
@@ -1020,6 +1021,15 @@ static void flow_offload_work_stats(struct flow_offload_work *offload)
 			nf_ct_acct_add(offload->flow->ct,
 				       FLOW_OFFLOAD_DIR_REPLY,
 				       stats[1].pkts, stats[1].bytes);
+	}
+
+	for (dir = 0; dir < FLOW_OFFLOAD_DIR_MAX; dir++) {
+		if (!stats[dir].pkts)
+			continue;
+		nf_flow_encap_tx_acct(offload->flow, dir, stats[dir].pkts,
+				      stats[dir].bytes);
+		nf_flow_encap_rx_acct(offload->flow, dir, stats[dir].pkts,
+				      stats[dir].bytes);
 	}
 }
 

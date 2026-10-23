@@ -368,6 +368,75 @@ void flow_offload_refresh(struct nf_flowtable *flow_table,
 }
 EXPORT_SYMBOL_GPL(flow_offload_refresh);
 
+/*
+ * A flow that leaves through an encapsulating device such as pppoe-wan is
+ * sent on the lower device directly (xmit_type DIRECT, out.ifidx is the upper
+ * device, out.hw_ifidx the lower one), so in hardware, and on the way in also
+ * in software, the upper device never sees its packets. Count them there when
+ * the device keeps the generic per-cpu software counters, as ppp does.
+ */
+static struct net_device *
+nf_flow_encap_dev(const struct flow_offload *flow,
+		  enum flow_offload_tuple_dir dir)
+{
+	const struct flow_offload_tuple *tuple = &flow->tuplehash[dir].tuple;
+	struct net_device *dev;
+
+	if (tuple->xmit_type != FLOW_OFFLOAD_XMIT_DIRECT ||
+	    tuple->out.ifidx == tuple->out.hw_ifidx)
+		return NULL;
+
+	dev = dev_get_by_index_rcu(nf_ct_net(flow->ct), tuple->out.ifidx);
+	if (!dev || dev->pcpu_stat_type != NETDEV_PCPU_STAT_TSTATS)
+		return NULL;
+
+	return dev;
+}
+
+/* Packets of @dir went out through the upper device of their own tuple. */
+void nf_flow_encap_tx_acct(const struct flow_offload *flow,
+			   enum flow_offload_tuple_dir dir,
+			   u64 packets, u64 bytes)
+{
+	struct pcpu_sw_netstats *tstats;
+	struct net_device *dev;
+
+	rcu_read_lock();
+	dev = nf_flow_encap_dev(flow, dir);
+	if (dev) {
+		local_bh_disable();
+		tstats = this_cpu_ptr(dev->tstats);
+		u64_stats_update_begin(&tstats->syncp);
+		u64_stats_add(&tstats->tx_packets, packets);
+		u64_stats_add(&tstats->tx_bytes, bytes);
+		u64_stats_update_end(&tstats->syncp);
+		local_bh_enable();
+	}
+	rcu_read_unlock();
+}
+
+/* Packets of @dir came in through the device the other direction leaves by. */
+void nf_flow_encap_rx_acct(const struct flow_offload *flow,
+			   enum flow_offload_tuple_dir dir,
+			   u64 packets, u64 bytes)
+{
+	struct pcpu_sw_netstats *tstats;
+	struct net_device *dev;
+
+	rcu_read_lock();
+	dev = nf_flow_encap_dev(flow, !dir);
+	if (dev) {
+		local_bh_disable();
+		tstats = this_cpu_ptr(dev->tstats);
+		u64_stats_update_begin(&tstats->syncp);
+		u64_stats_add(&tstats->rx_packets, packets);
+		u64_stats_add(&tstats->rx_bytes, bytes);
+		u64_stats_update_end(&tstats->syncp);
+		local_bh_enable();
+	}
+	rcu_read_unlock();
+}
+
 static void flow_offload_del(struct nf_flowtable *flow_table,
 			     struct flow_offload *flow)
 {

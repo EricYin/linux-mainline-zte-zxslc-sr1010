@@ -282,6 +282,12 @@ void flow_offload_route_init(struct flow_offload *flow,
 int flow_offload_add(struct nf_flowtable *flow_table, struct flow_offload *flow);
 void flow_offload_refresh(struct nf_flowtable *flow_table,
 			  struct flow_offload *flow, bool force);
+void nf_flow_encap_tx_acct(const struct flow_offload *flow,
+			   enum flow_offload_tuple_dir dir,
+			   u64 packets, u64 bytes);
+void nf_flow_encap_rx_acct(const struct flow_offload *flow,
+			   enum flow_offload_tuple_dir dir,
+			   u64 packets, u64 bytes);
 
 struct flow_offload_tuple_rhash *flow_offload_lookup(struct nf_flowtable *flow_table,
 						     struct flow_offload_tuple *tuple);

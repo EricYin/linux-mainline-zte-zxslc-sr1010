@@ -410,6 +410,9 @@ static int nf_flow_offload_forward(struct nf_flowtable_ctx *ctx,
 
 	if (flow_table->flags & NF_FLOWTABLE_COUNTER)
 		nf_ct_acct_update(flow->ct, tuplehash->tuple.dir, skb->len);
+	/* Sending through the upper device counts there, receiving does not. */
+	if (tuplehash->tuple.encap_num)
+		nf_flow_encap_rx_acct(flow, dir, 1, skb->len);
 
 	return 1;
 }
@@ -688,6 +691,9 @@ static int nf_flow_offload_ipv6_forward(struct nf_flowtable_ctx *ctx,
 
 	if (flow_table->flags & NF_FLOWTABLE_COUNTER)
 		nf_ct_acct_update(flow->ct, tuplehash->tuple.dir, skb->len);
+	/* Sending through the upper device counts there, receiving does not. */
+	if (tuplehash->tuple.encap_num)
+		nf_flow_encap_rx_acct(flow, dir, 1, skb->len);
 
 	return 1;
 }
