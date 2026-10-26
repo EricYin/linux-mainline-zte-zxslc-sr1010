@@ -364,14 +364,14 @@ config COMMON_CLK_ZX279133
 	  ZX279133 SoC.
 
 config ZTE_ZX279133_CPUFREQ_PROBE
-	bool "Allow isolated ZX279133 CPU clock parent switching"
+	bool "Allow ZX279133 CPU PLL frequency scaling"
 	depends on COMMON_CLK_ZX279133
 	depends on CPU_FREQ && CPUFREQ_DT
 	help
-	  Allow a53_mclk to switch only between firmware-enabled, fixed-rate
-	  parents for an isolated RAM-only CPU frequency probe. The probe does
-	  not control the CPU voltage, reprogram a PLL, or change bus clocks.
-	  This option must remain disabled in normal builds.
+	  Allow a53_mclk to switch between its fixed-rate parents and the
+	  factory-programmed CPU PLL rates. This requires the matching CPU PWM
+	  regulator and OPP voltage table in the device tree. Use only on a
+	  ZX279133 board with the factory CPU PLL and PWM wiring verified.
 
 config COMMON_CLK_LOCHNAGAR
 	tristate "Cirrus Logic Lochnagar clock driver"

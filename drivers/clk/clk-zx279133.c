@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
+#include <linux/bitfield.h>
 #include <linux/clk-provider.h>
 #include <linux/delay.h>
 #include <linux/io.h>
+#include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/platform_device.h>
 #include <linux/reset-controller.h>
 #include <linux/slab.h>
@@ -17,6 +20,14 @@
 #define ZX279133_TOPCRM_GATE_FLAGS	CLK_IGNORE_UNUSED
 #define ZX279133_TOPCRM_SYS_MUX_CTRL	0x00
 #define ZX279133_TOPCRM_CPU_CCI_MUX_CTRL	0x04
+#define ZX279133_CPU_PLL_CONFIG0	0x00
+#define ZX279133_CPU_PLL_CONFIG1	0x04
+#define ZX279133_CPU_PLL_POWERDOWN	BIT(28)
+#define ZX279133_CPU_PLL_LOCK		BIT(30)
+#define ZX279133_CPU_PLL_LOCK_TIMEOUT	50
+#define ZX279133_CPU_MUX_MASK		GENMASK(2, 0)
+#define ZX279133_CPU_PLL_PARENT		7
+#define ZX279133_CPU_PLL_SAFE_PARENT	6
 #define ZX279133_TOPCRM_PON_NPPT_WCLK_MUX_CTRL	0x0c
 #define ZX279133_TOPCRM_UNI_SERDES_GATE_CTRL	0x44
 #define ZX279133_TOPCRM_PON_GATE_CTRL	0x48
@@ -104,6 +115,11 @@ struct zx279133_topcrm_gate_desc {
 
 struct zx279133_topcrm_clk {
 	spinlock_t lock; /* Protects the shared TOPCRM gate register. */
+	struct mutex cpu_pll_lock;
+	void __iomem *base;
+	void __iomem *cpu_pll_base;
+	struct clk_hw cpu_pll_hw;
+	struct clk_init_data cpu_pll_init;
 	struct clk_hw *parents[ZX279133_PARENT_COUNT];
 	struct clk_hw_onecell_data data;
 };
@@ -173,7 +189,7 @@ static const struct zx279133_topcrm_factor_desc topcrm_factors[] = {
 		.name = "clk688m", .fw_name = "pll-1376m", .mult = 1, .div = 2,
 	},
 	[ZX279133_PARENT_CLK1000M_CPU] = {
-		.name = "clk1000m_cpu", .fw_name = "pll-cpu", .mult = 1, .div = 2,
+		.name = "clk1000m_cpu", .mult = 1, .div = 2,
 	},
 	[ZX279133_PARENT_CLK32K] = {
 		.name = "clk32k768", .fw_name = "pll-1376m", .mult = 1,
@@ -339,6 +355,168 @@ zx279133_register_even_div(struct device *dev, const char *name,
 			CLK_DIVIDER_READ_ONLY, topcrm_even_div_table, lock);
 }
 
+struct zx279133_cpu_pll_rate {
+	unsigned long rate;
+	u32 config0;
+	u32 config1;
+};
+
+static const struct zx279133_cpu_pll_rate zx279133_cpu_pll_rates[] = {
+	{ 1800000000UL, 0x20104821, 0x15000000 },
+	{ 2000000000UL, 0x20105021, 0x15000000 },
+	{ 2200000000UL, 0x20105821, 0x15000000 },
+	{ 2400000000UL, 0x20106021, 0x15000000 },
+	{ 2600000000UL, 0x20106821, 0x15000000 },
+	{ 2800000000UL, 0x20107021, 0x15000000 },
+};
+
+static struct zx279133_topcrm_clk *
+zx279133_cpu_pll_to_topcrm(struct clk_hw *hw)
+{
+	return container_of(hw, struct zx279133_topcrm_clk, cpu_pll_hw);
+}
+
+static unsigned long zx279133_cpu_pll_recalc_rate(struct clk_hw *hw,
+						   unsigned long parent_rate)
+{
+	struct zx279133_topcrm_clk *priv = zx279133_cpu_pll_to_topcrm(hw);
+	u32 config0, config1;
+	unsigned int i;
+
+	(void)parent_rate;
+
+	config0 = readl(priv->cpu_pll_base + ZX279133_CPU_PLL_CONFIG0);
+	config1 = readl(priv->cpu_pll_base + ZX279133_CPU_PLL_CONFIG1);
+	config0 &= ~ZX279133_CPU_PLL_LOCK;
+	config1 &= GENMASK(23, 0);
+
+	for (i = 0; i < ARRAY_SIZE(zx279133_cpu_pll_rates); i++) {
+		const struct zx279133_cpu_pll_rate *entry =
+			&zx279133_cpu_pll_rates[i];
+
+		if (entry->config0 == config0 &&
+		    (entry->config1 & GENMASK(23, 0)) == config1)
+			return entry->rate;
+	}
+
+	return 0;
+}
+
+static long zx279133_cpu_pll_round_rate(struct clk_hw *hw,
+					 unsigned long rate,
+					 unsigned long *parent_rate)
+{
+	unsigned long best_rate = zx279133_cpu_pll_rates[0].rate;
+	unsigned long best_delta = rate > best_rate ? rate - best_rate :
+		best_rate - rate;
+	unsigned int i;
+
+	(void)hw;
+	(void)parent_rate;
+
+	for (i = 1; i < ARRAY_SIZE(zx279133_cpu_pll_rates); i++) {
+		unsigned long candidate = zx279133_cpu_pll_rates[i].rate;
+		unsigned long delta = rate > candidate ? rate - candidate :
+			candidate - rate;
+
+		if (delta < best_delta) {
+			best_rate = candidate;
+			best_delta = delta;
+		}
+	}
+
+	return best_rate;
+}
+
+static int zx279133_cpu_pll_set_rate(struct clk_hw *hw, unsigned long rate,
+				      unsigned long parent_rate)
+{
+	struct zx279133_topcrm_clk *priv = zx279133_cpu_pll_to_topcrm(hw);
+	const struct zx279133_cpu_pll_rate *entry = NULL;
+	void __iomem *mux_reg = priv->base + ZX279133_TOPCRM_CPU_CCI_MUX_CTRL;
+	void __iomem *enable_reg = priv->cpu_pll_base + ZX279133_CPU_PLL_CONFIG1;
+	unsigned long flags, timeout;
+	u32 mux, value;
+	bool restore_pll_parent = false;
+	unsigned int i;
+	int ret = -ETIMEDOUT;
+
+	(void)parent_rate;
+
+	for (i = 0; i < ARRAY_SIZE(zx279133_cpu_pll_rates); i++) {
+		if (zx279133_cpu_pll_rates[i].rate == rate) {
+			entry = &zx279133_cpu_pll_rates[i];
+			break;
+		}
+	}
+	if (!entry)
+		return -EINVAL;
+
+	mutex_lock(&priv->cpu_pll_lock);
+	spin_lock_irqsave(&priv->lock, flags);
+	mux = readl(mux_reg);
+	if (FIELD_GET(ZX279133_CPU_MUX_MASK, mux) ==
+	    ZX279133_CPU_PLL_PARENT) {
+		/*
+		 * The factory CPU clock notifier moves the CPU to the fixed
+		 * parent immediately before the rate-parent PLL is reprogrammed.
+		 * In this mux table that safe parent is FPP/6 (416 MHz).
+		 */
+		mux &= ~ZX279133_CPU_MUX_MASK;
+		mux |= FIELD_PREP(ZX279133_CPU_MUX_MASK,
+				  ZX279133_CPU_PLL_SAFE_PARENT);
+		writel(mux, mux_reg);
+		restore_pll_parent = true;
+	}
+
+	/*
+	 * Factory pll-en-bit = <60 1> is a linear bit index and an
+	 * active-low flag: CONFIG1 bit 28, not TOPCRM offset 0x3c.
+	 * TOPCRM + 0x3c controls USB gates and must not be touched here.
+	 */
+	value = readl(enable_reg) | ZX279133_CPU_PLL_POWERDOWN;
+	writel(value, enable_reg);
+	readl(enable_reg);
+	writel(entry->config0,
+	       priv->cpu_pll_base + ZX279133_CPU_PLL_CONFIG0);
+	writel(entry->config1 | ZX279133_CPU_PLL_POWERDOWN,
+	       priv->cpu_pll_base + ZX279133_CPU_PLL_CONFIG1);
+	readl(priv->cpu_pll_base + ZX279133_CPU_PLL_CONFIG1);
+	value = readl(enable_reg) & ~ZX279133_CPU_PLL_POWERDOWN;
+	writel(value, enable_reg);
+	readl(enable_reg);
+	spin_unlock_irqrestore(&priv->lock, flags);
+
+	timeout = jiffies + ZX279133_CPU_PLL_LOCK_TIMEOUT;
+	do {
+		if (readl(priv->cpu_pll_base + ZX279133_CPU_PLL_CONFIG0) &
+		    ZX279133_CPU_PLL_LOCK) {
+			ret = 0;
+			break;
+		}
+		cpu_relax();
+	} while (time_before(jiffies, timeout));
+
+	if (!ret && restore_pll_parent) {
+		spin_lock_irqsave(&priv->lock, flags);
+		mux = readl(mux_reg);
+		mux &= ~ZX279133_CPU_MUX_MASK;
+		mux |= FIELD_PREP(ZX279133_CPU_MUX_MASK,
+				  ZX279133_CPU_PLL_PARENT);
+		writel(mux, mux_reg);
+		spin_unlock_irqrestore(&priv->lock, flags);
+	}
+
+	mutex_unlock(&priv->cpu_pll_lock);
+	return ret;
+}
+
+static const struct clk_ops zx279133_cpu_pll_ops = {
+	.recalc_rate = zx279133_cpu_pll_recalc_rate,
+	.round_rate = zx279133_cpu_pll_round_rate,
+	.set_rate = zx279133_cpu_pll_set_rate,
+};
+
 static int zx279133_topcrm_clk_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -350,6 +528,7 @@ static int zx279133_topcrm_clk_probe(struct platform_device *pdev)
 	struct clk_hw *pvt_div;
 	struct clk_hw *hw;
 	void __iomem *base;
+	void __iomem *cpu_pll_base;
 	void __iomem *reg;
 	unsigned int index;
 	int ret;
@@ -364,12 +543,34 @@ static int zx279133_topcrm_clk_probe(struct platform_device *pdev)
 	if (IS_ERR(base))
 		return PTR_ERR(base);
 
+	cpu_pll_base = devm_platform_ioremap_resource(pdev, 1);
+	if (IS_ERR(cpu_pll_base))
+		return dev_err_probe(dev, PTR_ERR(cpu_pll_base),
+				     "failed to map CPU PLL registers\n");
+
 	spin_lock_init(&priv->lock);
+	mutex_init(&priv->cpu_pll_lock);
+	priv->base = base;
+	priv->cpu_pll_base = cpu_pll_base;
+	priv->cpu_pll_init.name = "pll-cpu";
+	priv->cpu_pll_init.ops = &zx279133_cpu_pll_ops;
+	priv->cpu_pll_init.flags = CLK_GET_RATE_NOCACHE;
+	priv->cpu_pll_hw.init = &priv->cpu_pll_init;
+	ret = devm_clk_hw_register(dev, &priv->cpu_pll_hw);
+	if (ret)
+		return dev_err_probe(dev, ret,
+				     "failed to register CPU PLL\n");
+
 	for (index = 0; index < ARRAY_SIZE(topcrm_factors); index++) {
 		const struct zx279133_topcrm_factor_desc *desc =
 			&topcrm_factors[index];
 
-		hw = zx279133_register_factor(dev, desc);
+		if (index == ZX279133_PARENT_CLK1000M_CPU)
+			hw = devm_clk_hw_register_fixed_factor(dev, desc->name,
+					"pll-cpu", CLK_SET_RATE_PARENT,
+					desc->mult, desc->div);
+		else
+			hw = zx279133_register_factor(dev, desc);
 		if (IS_ERR(hw))
 			return dev_err_probe(dev, PTR_ERR(hw),
 					     "failed to register %s factor\n",
@@ -436,13 +637,17 @@ static int zx279133_topcrm_clk_probe(struct platform_device *pdev)
 	a53_mclk_parents[5].hw = priv->parents[ZX279133_PARENT_CLK688M];
 	a53_mclk_parents[6].hw = priv->parents[ZX279133_PARENT_CLK416M];
 	a53_mclk_parents[7].hw = priv->parents[ZX279133_PARENT_CLK1000M_CPU];
-	hw = zx279133_register_mux(dev, "a53_mclk", a53_mclk_parents,
-				   ARRAY_SIZE(a53_mclk_parents),
-				   base + ZX279133_TOPCRM_CPU_CCI_MUX_CTRL,
-				   0, 3,
-				   IS_ENABLED(CONFIG_ZTE_ZX279133_CPUFREQ_PROBE) ?
-					0 : CLK_MUX_READ_ONLY,
-				   &priv->lock);
+	hw = devm_clk_hw_register_mux_parent_data_table(dev, "a53_mclk",
+						 a53_mclk_parents,
+						 ARRAY_SIZE(a53_mclk_parents),
+						 CLK_GET_RATE_NOCACHE |
+						 (IS_ENABLED(CONFIG_ZTE_ZX279133_CPUFREQ_PROBE) ?
+						  CLK_SET_RATE_PARENT : 0),
+						 base + ZX279133_TOPCRM_CPU_CCI_MUX_CTRL,
+						 0, 3,
+						 IS_ENABLED(CONFIG_ZTE_ZX279133_CPUFREQ_PROBE) ?
+						  0 : CLK_MUX_READ_ONLY,
+						 NULL, &priv->lock);
 	if (IS_ERR(hw))
 		return dev_err_probe(dev, PTR_ERR(hw),
 				     "failed to register a53_mclk mux\n");
