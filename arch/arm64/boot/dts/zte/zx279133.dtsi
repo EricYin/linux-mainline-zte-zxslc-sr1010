@@ -40,12 +40,60 @@
 		clock-output-names = "pll_fpp_2500m_clk";
 	};
 
-	/* Keep the CPU PLL read-only until safe voltage scaling is implemented. */
-	pll_cpu: clock-pll-cpu-2000m {
-		compatible = "fixed-clock";
-		#clock-cells = <0>;
-		clock-frequency = <2000000000>;
-		clock-output-names = "pll_2000m_clk";
+	/* Factory CPU PLL programming and CPU supply are provided by TOPCRM/PWM. */
+	cpu_opp_table: opp-table-cpu {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		/* Factory's 400 MHz mux-only path has no verified voltage OPP. */
+		opp-500000000 {
+			opp-hz = /bits/ 64 <500000000>;
+			opp-microvolt = <842000>;
+			clock-latency-ns = <300000>;
+		};
+
+		opp-688128000 {
+			/* Factory's nominal 688 MHz, from 1376.256 MHz / 2. */
+			opp-hz = /bits/ 64 <688128000>;
+			opp-microvolt = <850000>;
+			clock-latency-ns = <300000>;
+		};
+
+		opp-900000000 {
+			opp-hz = /bits/ 64 <900000000>;
+			opp-microvolt = <858000>;
+			clock-latency-ns = <300000>;
+		};
+
+		opp-1000000000 {
+			opp-hz = /bits/ 64 <1000000000>;
+			opp-microvolt = <858000>;
+			clock-latency-ns = <300000>;
+		};
+
+		opp-1100000000 {
+			opp-hz = /bits/ 64 <1100000000>;
+			opp-microvolt = <865000>;
+			clock-latency-ns = <310000>;
+		};
+
+		opp-1200000000 {
+			opp-hz = /bits/ 64 <1200000000>;
+			opp-microvolt = <873000>;
+			clock-latency-ns = <290000>;
+		};
+
+		opp-1300000000 {
+			opp-hz = /bits/ 64 <1300000000>;
+			opp-microvolt = <873000>;
+			clock-latency-ns = <290000>;
+		};
+
+		/* 2.8 GHz CPU PLL output divided by two for the A53 clock. */
+		opp-1400000000 {
+			opp-hz = /bits/ 64 <1400000000>;
+			opp-microvolt = <881000>;
+		};
 	};
 
 	cpus {
@@ -57,6 +105,8 @@
 			device_type = "cpu";
 			reg = <0x0 0x0>;
 			clocks = <&topcrm ZX279133_TOPCRM_CLK_A53_MCLK>;
+			cpu-supply = <&cpu_regulator>;
+			operating-points-v2 = <&cpu_opp_table>;
 			enable-method = "psci";
 		};
 
@@ -65,6 +115,8 @@
 			device_type = "cpu";
 			reg = <0x0 0x1>;
 			clocks = <&topcrm ZX279133_TOPCRM_CLK_A53_MCLK>;
+			cpu-supply = <&cpu_regulator>;
+			operating-points-v2 = <&cpu_opp_table>;
 			enable-method = "psci";
 		};
 	};
@@ -105,11 +157,12 @@
 
 		topcrm: clock-controller@10e10000 {
 			compatible = "zte,zx279133-topcrm", "syscon";
-			reg = <0x0 0x10e10000 0x0 0x60>;
-			clocks = <&osc25m>, <&pll_lsp>, <&pll_1376m>, <&pll_fpp>,
-				 <&pll_cpu>;
+			reg = <0x0 0x10e10000 0x0 0x60>,
+			      <0x0 0x10e10080 0x0 0x10>;
+			reg-names = "topcrm", "cpu-pll";
+			clocks = <&osc25m>, <&pll_lsp>, <&pll_1376m>, <&pll_fpp>;
 			clock-names = "osc25m", "pll-lsp", "pll-1376m",
-				      "pll-fpp", "pll-cpu";
+				      "pll-fpp";
 			#clock-cells = <1>;
 		};
 
@@ -184,6 +237,11 @@
 				function = "spifc";
 				pins = "p3-9", "p3-10", "p3-11", "p3-12",
 				       "p4-0", "p4-1";
+			};
+
+			pwm_pins: pwm-pins {
+				function = "pwm";
+				pins = "p0-8", "p0-9", "p0-12", "p0-13";
 			};
 		};
 
@@ -374,8 +432,26 @@
 			clocks = <&lsp1_clk ZX279133_LSP1_CLK_PWM_PCLK>,
 				 <&lsp1_clk ZX279133_LSP1_CLK_PWM_WCLK>;
 			clock-names = "pclk", "wclk";
+			pinctrl-names = "default";
+			pinctrl-0 = <&pwm_pins>;
 			#pwm-cells = <3>;
-			status = "disabled";
+			status = "okay";
+		};
+
+		cpu_regulator: regulator-cpu {
+			compatible = "pwm-regulator";
+			regulator-name = "vcc0v8_a53";
+			regulator-min-microvolt = <800000>;
+			regulator-max-microvolt = <881000>;
+			regulator-boot-on;
+			regulator-always-on;
+			/* Provisional wait from the vendor OPP latency; not a rail measurement. */
+			regulator-settling-time-us = <310>;
+			pwms = <&pwm 1 1600 0>;
+			voltage-table = <800000 100>, <809000 90>, <817000 80>,
+					<825000 70>, <833000 60>, <842000 50>,
+					<850000 40>, <858000 30>, <865000 20>,
+					<873000 10>, <881000 0>;
 		};
 
 		efuse: efuse@14f11000 {
